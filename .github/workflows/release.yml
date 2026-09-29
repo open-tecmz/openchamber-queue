@@ -1,13 +1,16 @@
 name: build
 
-# Build the installable package on every push to main and publish it two ways:
-#   1. force-push the built files to the `release` branch, so users can install
-#      with a git URL and get in-app updates (the host compares the package.json
-#      version on that branch);
-#   2. attach a .zip of the same package to a GitHub Release, for download installs.
+# Package the extension and publish it for installs:
+#   - push to main  -> rolling `latest` release (always marked Latest) + refresh
+#                      the orphan `release` branch, so a git-URL install can
+#                      update in place (the host compares package.json version);
+#   - push tag vX.Y.Z -> a `vX.Y.Z` release (also marked Latest) + refresh the
+#                      `release` branch.
+# Both paths attach the same .zip of the built package for download installs.
 on:
   push:
     branches: [main]
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 permissions:
@@ -34,27 +37,34 @@ jobs:
       - name: Build dist/
         run: npm run build
 
-      - name: Read package version
+      # A vX.Y.Z tag is a versioned release; anything else (main) is the rolling
+      # "latest" build. Both are published the same way.
+      - name: Resolve release identity
         id: meta
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "title=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "zip=openchamber-queue-${GITHUB_REF_NAME}.zip" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "title=latest" >> "$GITHUB_OUTPUT"
+            echo "zip=openchamber-queue-latest.zip" >> "$GITHUB_OUTPUT"
+          fi
 
       # Zip first, while dist/ is still pristine: the branch step below creates a
       # .git inside dist/, which must not end up in the archive.
       - name: Zip package
-        id: zip
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          name="openchamber-queue-${VERSION}.zip"
-          (cd dist && zip -qr "../${name}" . -x '.git/*')
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ZIP: ${{ steps.meta.outputs.zip }}
+        run: (cd dist && zip -qr "../${ZIP}" . -x '.git/*')
 
       # Publish the built package as an orphan `release` branch. It replaces the
       # previous build, so the branch has a single commit and no source files.
       - name: Publish release branch
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -64,18 +74,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -q -m "release v${VERSION}"
+          git commit -q -m "build ${TAG}"
           git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push -f origin release
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          ZIP: ${{ steps.zip.outputs.name }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TITLE: ${{ steps.meta.outputs.title }}
+          ZIP: ${{ steps.meta.outputs.zip }}
         run: |
           set -euo pipefail
-          gh release create "v${VERSION}" "${ZIP}" \
-            --title "v${VERSION}" \
-            --notes "Built from ${GITHUB_SHA}." \
-            || gh release upload "v${VERSION}" "${ZIP}" --clobber
+          notes="Built from ${GITHUB_SHA}."
+          # --latest: every release, rolling "latest" or a vX.Y.Z tag, becomes Latest.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ZIP}" --clobber
+            gh release edit "${TAG}" --title "${TITLE}" --notes "${notes}" --latest
+          else
+            gh release create "${TAG}" "${ZIP}" --title "${TITLE}" --notes "${notes}" --latest
+          fi

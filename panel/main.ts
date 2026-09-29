@@ -20,6 +20,8 @@ import {
   mountSeparator,
   mountSwitch,
   mountTextField,
+  type TextFieldHandle,
+  type TextFieldProps,
 } from '@openchamber/sdk/ui';
 
 import {
@@ -339,6 +341,38 @@ const el = (tag: string, className?: string, text?: string): HTMLElement => {
   return node;
 };
 
+// The rail has little vertical room: let a multiline field grow with its text
+// but cap the height so a long task scrolls internally instead of pushing the
+// list off-screen.
+const FIELD_MAX_HEIGHT = 200;
+
+const mountGrowingField = (root: Element, initial: TextFieldProps): TextFieldHandle => {
+  const field = mountTextField(root, initial);
+  const input = root.lastElementChild?.querySelector('textarea.oc-sdk-input') ?? null;
+  if (!(input instanceof HTMLTextAreaElement)) return field;
+
+  input.style.resize = 'none';
+  const resize = (): void => {
+    input.style.height = 'auto';
+    const height = Math.min(input.scrollHeight, FIELD_MAX_HEIGHT);
+    input.style.height = `${height}px`;
+    input.style.overflowY = input.scrollHeight > FIELD_MAX_HEIGHT ? 'auto' : 'hidden';
+  };
+  input.addEventListener('input', resize);
+  resize();
+
+  return {
+    update: (next) => {
+      field.update(next);
+      resize();
+    },
+    dispose: () => {
+      input.removeEventListener('input', resize);
+      field.dispose();
+    },
+  };
+};
+
 const disposables: Array<{ dispose: () => void }> = [];
 const clearDisposables = (): void => {
   while (disposables.length > 0) disposables.pop()?.dispose();
@@ -418,7 +452,7 @@ const render = (): void => {
 
   const composer = root.appendChild(el('div', 'qx-composer'));
   let draft = '';
-  const field = mountTextField(composer, {
+  const field = mountGrowingField(composer, {
     label: t('composer.label'),
     value: draft,
     placeholder: t('composer.placeholder'),
@@ -532,7 +566,7 @@ const renderTask = (task: QueueTask, position: number): HTMLElement => {
 
 const renderEditor = (task: QueueTask): HTMLElement => {
   const card = el('div', 'qx-edit');
-  const field = mountTextField(card, {
+  const field = mountGrowingField(card, {
     value: draftText,
     multiline: true,
     rows: 4,

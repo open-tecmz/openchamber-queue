@@ -1,14 +1,38 @@
+<div align="center">
+
 # OpenChamber 队列
+
+**给 [OpenChamber](https://openchamber.dev) 的按项目任务队列扩展。**
+添加任务、打开开关，项目一空闲，下一个任务就会自动开始运行 —— 一次一个，无需逐个点击。
 
 [English](./README.md) · 简体中文
 
-给 [OpenChamber](https://openchamber.dev) 的**按项目任务队列**扩展。往项目里添加任务、打开开关，
-当该项目**没有正在运行的会话**时，OpenChamber 会自动用下一个任务创建会话并发送内容。
-每个项目同时只跑一个队列任务。
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](./LICENSE)
+[![OpenChamber](https://img.shields.io/badge/OpenChamber-%3E%3D%202.0.0-6f42c1.svg)](https://openchamber.dev)
+[![Panel languages](https://img.shields.io/badge/panel_en%20%2F%20zh--cn%20%2F%20zh--tw-2ea44f.svg)](#语言)
 
-任务只有一个字段：**内容**，也就是提示词。模型、agent 等使用项目自身的默认选择。
+<img src="./demo/screenshot/demo.png" alt="队列面板：启用开关、任务输入框与待执行列表" width="640" />
+
+</div>
+
+任务只有一个字段：**内容**，也就是提示词。模型、agent 等使用项目自身的默认选择。只要该项目
+**没有正在运行的会话**，任务就会立刻开始，因此没有任务时侧栏保持安静。
 
 > 这是一个 OpenChamber **扩展**（面板 + 本地服务），不是 OpenCode 插件。
+
+## 目录
+
+- [功能](#功能)
+- [工作原理](#工作原理) · [调度规则](#调度规则) · [后台 / 前台](#后台--前台)
+- [安装](#安装)
+- [使用](#使用)
+- [存储与持久化](#存储与持久化)
+- [权限](#权限)
+- [已知限制](#已知限制)
+- [开发](#开发)
+- [目录结构](#目录结构)
+- [语言](#语言)
+- [许可证](#许可证)
 
 ## 功能
 
@@ -83,13 +107,13 @@
 
 | 数据 | 位置 |
 | --- | --- |
-| 队列数据（后台模式） | `<OpenChamber 数据目录>/openchamber-queue/state.json` |
+| 队列数据（后台模式） | `~/.config/openchamber-queue/state.json`，或 `$OPENCHAMBER_QUEUE_DATA_DIR/state.json` |
 | 队列数据（前台模式） | 宿主存储 `<OpenChamber 数据目录>/guest-storage/queue.json` |
 | 安装记录与权限 | `<OpenChamber 数据目录>/extensions.json` |
 
-数据目录默认为 `~/.config/openchamber`（Windows 为 `%APPDATA%\openchamber`；桌面端
-设置时可能在 `~/Library/Application Support/openchamber`），可通过
-`OPENCHAMBER_DATA_DIR` 覆盖。
+后台队列把状态文件单独放在宿主数据目录**旁边**，绝不放进任何项目目录里。宿主数据目录为
+`~/.config/openchamber`，除非宿主侧设置了 `OPENCHAMBER_DATA_DIR`（该变量不会传给 service
+进程，因此自定义的宿主数据目录不会被镜像过来）。
 
 数据是普通 JSON 文件，**重启、升级、卸载都不会丢**。但**后台 worker 不会自动启动**：
 OpenChamber 只在有请求时才拉起扩展服务，因此 OpenChamber 进程重启后，队列会暂停，
@@ -97,7 +121,7 @@ OpenChamber 只在有请求时才拉起扩展服务，因此 OpenChamber 进程�
 队列会从断点继续。
 
 卸载扩展会删除宿主托管的前台存储；要一并清空后台队列，请手动删除
-`<数据目录>/openchamber-queue/`。
+`~/.config/openchamber-queue/`。
 
 ## 权限
 
@@ -137,13 +161,16 @@ npm test            # 先构建，再针对 stub OpenChamber 跑隔离端到端�
 `npm test` 覆盖后台服务。
 
 宿主不会编译扩展：只发布已构建文件。新增语言只需改 `src/i18n.ts` 并重新构建。这里只使用
-`devDependencies`，仓库不包含 `node_modules`。
+`devDependencies`，仓库不包含 `node_modules`。每次改动都要在 `changelog.md` 中记录
+（规范见 `AGENTS.md`）。
 
 ## 目录结构
 
 ```
 package.json            扩展清单与脚本
 icon.svg                侧栏图标
+AGENTS.md               仓库规范（changelog 约定）
+changelog.md            各版本的变更记录
 scripts/build.mjs       组装 dist/（可安装包）
 .github/workflows/      CI：构建 dist/，发布 release 分支与 zip
 src/core.ts             队列模型与纯函数 planTick 规则（面板与服务共用）
@@ -155,6 +182,7 @@ service/main.ts         后台 worker        -> dist/service/main.js
 dist/                   构建出的可安装包（生成物，不提交）
 PROPOSAL.md             最初的设计规划
 README.md               英文说明
+README.zh-CN.md         简体中文说明（本文件）
 _temp/                  本地测试脚本（不随包发布）
 ```
 
@@ -166,4 +194,4 @@ _temp/                  本地测试脚本（不随包发布）
 
 ## 许可证
 
-[MIT](./LICENSE)。
+[Apache-2.0](./LICENSE)。

@@ -56,14 +56,25 @@ const SESSION_LIMIT = 30;
 const MAX_STEPS_PER_TICK = 4;
 
 // ---------------------------------------------------------------------------
-// Data directory and persistence
+// Data directories and persistence
 // ---------------------------------------------------------------------------
 
-/** HOME / XDG_CONFIG_HOME are inherited; OPENCHAMBER_DATA_DIR is not, so we mirror the CLI default. */
-const DATA_DIR = process.env.OPENCHAMBER_DATA_DIR
-  || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'openchamber');
+/**
+ * Where the host keeps its own files: the run file and settings.json we read to
+ * find the OpenChamber server. This must match the host's own resolution
+ * (`OPENCHAMBER_DATA_DIR`, else `~/.config/openchamber`). HOME is inherited by
+ * the service, but OPENCHAMBER_DATA_DIR is not, so a custom host dir is not
+ * visible here — the default is the only case we can mirror.
+ */
+const HOST_DATA_DIR = process.env.OPENCHAMBER_DATA_DIR
+  || path.join(os.homedir(), '.config', 'openchamber');
 
-const STATE_DIR = path.join(DATA_DIR, 'openchamber-queue');
+/**
+ * Our own queue state, kept beside the host data dir rather than inside it:
+ * `~/.config/openchamber-queue/state.json`. Never inside a project.
+ */
+const STATE_DIR = process.env.OPENCHAMBER_QUEUE_DATA_DIR
+  || path.join(os.homedir(), '.config', 'openchamber-queue');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
 let state: QueueState = emptyState();
@@ -119,7 +130,7 @@ const isHealthy = async (port: number): Promise<boolean> => {
 
 const readInstancePassword = async (port: number): Promise<string | null> => {
   try {
-    const raw = await fsp.readFile(path.join(DATA_DIR, 'run', `openchamber-${port}.json`), 'utf8');
+    const raw = await fsp.readFile(path.join(HOST_DATA_DIR, 'run', `openchamber-${port}.json`), 'utf8');
     const parsed = JSON.parse(raw) as { uiPassword?: string };
     return typeof parsed.uiPassword === 'string' && parsed.uiPassword ? parsed.uiPassword : null;
   } catch {
@@ -129,7 +140,7 @@ const readInstancePassword = async (port: number): Promise<string | null> => {
 
 const readDesktop = async (): Promise<{ port: number | null; token: string | null }> => {
   try {
-    const raw = await fsp.readFile(path.join(DATA_DIR, 'settings.json'), 'utf8');
+    const raw = await fsp.readFile(path.join(HOST_DATA_DIR, 'settings.json'), 'utf8');
     const parsed = JSON.parse(raw) as { desktopLocalPort?: number; desktopLocalClientToken?: string };
     return {
       port: Number.isFinite(parsed.desktopLocalPort) ? Number(parsed.desktopLocalPort) : null,
@@ -145,7 +156,7 @@ const candidatePorts = async (): Promise<number[]> => {
   const desktop = await readDesktop();
   if (desktop.port) ports.push(desktop.port);
   try {
-    const entries = await fsp.readdir(path.join(DATA_DIR, 'run'));
+    const entries = await fsp.readdir(path.join(HOST_DATA_DIR, 'run'));
     for (const name of entries) {
       const match = /^openchamber-(\d+)\.json$/.exec(name);
       if (match) ports.push(Number(match[1]));

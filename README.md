@@ -1,16 +1,40 @@
+<div align="center">
+
 # OpenChamber Queue
+
+**A per-project task queue for [OpenChamber](https://openchamber.dev).**
+Add tasks, flip the queue on, and the next task starts on its own whenever the
+project is idle — one task at a time, no clicks per task.
 
 English · [简体中文](./README.zh-CN.md)
 
-A per-project task queue for [OpenChamber](https://openchamber.dev). Add tasks to a
-project, turn the queue on, and OpenChamber starts a session with the next task
-whenever that project has **no running session**. One queue task runs per project at
-a time.
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](./LICENSE)
+[![OpenChamber](https://img.shields.io/badge/OpenChamber-%3E%3D%202.0.0-6f42c1.svg)](https://openchamber.dev)
+[![Panel languages](https://img.shields.io/badge/panel_en%20%2F%20zh--cn%20%2F%20zh--tw-2ea44f.svg)](#languages)
+
+<img src="./demo/screenshot/demo.png" alt="The Queue panel: an enable switch, a task box and the pending list" width="640" />
+
+</div>
 
 A task has a single field: **the content**, which is the prompt. Model, agent and
-variant come from the project's own defaults.
+variant come from the project's own defaults. A task starts as soon as that project
+has **no running session**, so the rail stays quiet until there is work to do.
 
 > Built as an OpenChamber **extension** (panel + local service), not an OpenCode plugin.
+
+## Contents
+
+- [Features](#features)
+- [How it works](#how-it-works) · [Dispatch rules](#dispatch-rules) · [Background vs foreground](#background-vs-foreground)
+- [Install](#install)
+- [Usage](#usage)
+- [Storage and persistence](#storage-and-persistence)
+- [Permissions](#permissions)
+- [Limitations](#limitations)
+- [Development](#development)
+- [Project layout](#project-layout)
+- [Languages](#languages)
+- [License](#license)
 
 ## Features
 
@@ -97,13 +121,14 @@ Other ways to add a task:
 
 | Data | Location |
 | --- | --- |
-| Queue state (background mode) | `<OpenChamber data dir>/openchamber-queue/state.json` |
+| Queue state (background mode) | `~/.config/openchamber-queue/state.json`, or `$OPENCHAMBER_QUEUE_DATA_DIR/state.json` |
 | Queue state (foreground mode) | host storage, `<OpenChamber data dir>/guest-storage/queue.json` |
 | Install record and grants | `<OpenChamber data dir>/extensions.json` |
 
-The data dir defaults to `~/.config/openchamber` (`%APPDATA%\openchamber` on
-Windows, `~/Library/Application Support/openchamber` where the desktop app sets
-one), unless `OPENCHAMBER_DATA_DIR` is set.
+The background queue keeps its own file *beside* the host's data dir — never inside
+a project. The host data dir is `~/.config/openchamber`, unless `OPENCHAMBER_DATA_DIR`
+is set on the host (a service process does not receive that variable, so a custom
+host dir is not mirrored).
 
 Data is a plain JSON file, so it survives restarts, updates and uninstalling. The
 **worker, however, does not auto-start**: OpenChamber spawns a guest service only on
@@ -112,7 +137,7 @@ the panel once (or run a message action / `/queue` command). After that it is
 resident again. A queue that was enabled resumes where it left off.
 
 Uninstalling the extension removes the host-owned foreground storage; delete
-`<data dir>/openchamber-queue/` by hand to wipe the background queue too.
+`~/.config/openchamber-queue/` by hand to wipe the background queue too.
 
 ## Permissions
 
@@ -158,13 +183,16 @@ headless service.
 
 The host never compiles an extension: ship built files only. Editing `src/i18n.ts`
 and rebuilding is enough to add a language. These are the only `devDependencies`;
-nothing here ships `node_modules`.
+nothing here ships `node_modules`. Record every change in `changelog.md` before you
+finish — the repo rule lives in `AGENTS.md`.
 
 ## Project layout
 
 ```
 package.json            extension manifest + scripts
 icon.svg                rail icon
+AGENTS.md               repo conventions (the changelog rule)
+changelog.md            notable changes, per release
 scripts/build.mjs       assembles dist/ (the installable package)
 .github/workflows/      CI: build dist/, publish the release branch + zip
 src/core.ts             queue model and the pure planTick rule (shared)
@@ -175,6 +203,7 @@ panel/background.html   on-demand page for actions and /queue
 service/main.ts         background worker         -> dist/service/main.js
 dist/                   built installable package (generated, not committed)
 PROPOSAL.md             original design notes
+README.md               English documentation (this file)
 README.zh-CN.md         简体中文说明
 _temp/                  local test harness (not shipped)
 ```
@@ -189,4 +218,4 @@ documentation ships in English (this file) and 简体中文
 
 ## License
 
-[MIT](./LICENSE).
+[Apache-2.0](./LICENSE).
