@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="light dark" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        background: var(--oc-bg);
+        color: var(--oc-fg);
+        font: 13px/1.5 var(--oc-font, system-ui, sans-serif);
+      }
+      #root {
+        height: 100%;
+        box-sizing: border-box;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        overflow: hidden;
+      }
+      .qx-header {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        flex: none;
+      }
+      .qx-title-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .qx-title {
+        font-weight: 650;
+        font-size: 14px;
+      }
+      .qx-project {
+        color: var(--oc-muted);
+        font-size: 12px;
+        word-break: break-all;
+      }
+      .qx-counts {
+        margin-left: auto;
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .qx-composer {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        flex: none;
+      }
+      .qx-composer-actions {
+        display: flex;
+        justify-content: flex-end;
+      }
+      .qx-list {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--oc-border);
+        border-radius: var(--oc-radius, 8px);
+      }
+      .qx-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+      }
+      .qx-row + .qx-row,
+      .qx-row + .qx-edit,
+      .qx-edit + .qx-row,
+      .qx-edit + .qx-edit {
+        border-top: 1px solid var(--oc-border);
+      }
+      .qx-row-editable {
+        cursor: pointer;
+      }
+      .qx-row-editable:hover {
+        background: var(--oc-hover);
+      }
+      .qx-row-body {
+        flex: 1;
+        min-width: 0;
+      }
+      .qx-row-text {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .qx-row-sub {
+        color: var(--oc-muted);
+        font-size: 11px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .qx-row-actions {
+        display: flex;
+        gap: 4px;
+        flex: none;
+      }
+      .qx-pos {
+        color: var(--oc-muted);
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+        min-width: 16px;
+        text-align: right;
+      }
+      .qx-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex: none;
+        background: var(--oc-muted);
+      }
+      .qx-dot-running {
+        background: var(--oc-primary);
+      }
+      .qx-dot-failed {
+        background: var(--oc-error);
+      }
+      .qx-edit {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+      }
+      .qx-edit-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+      .qx-footer {
+        display: flex;
+        gap: 8px;
+        flex: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="main.js"></script>
+  </body>
+</html>
