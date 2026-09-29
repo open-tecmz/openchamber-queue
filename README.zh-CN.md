@@ -30,7 +30,6 @@
 - [权限](#权限)
 - [已知限制](#已知限制)
 - [开发](#开发)
-- [目录结构](#目录结构)
 - [语言](#语言)
 - [许可证](#许可证)
 
@@ -77,10 +76,12 @@
 
 1. **设置 → 扩展**。
 2. 在 **文件夹、ZIP 或 URL** 中粘贴以下之一并点击 **添加**：
+   - 最新打包的 zip —— 下面的地址始终指向最新构建：
+     `https://github.com/open-tecmz/openchamber-queue/releases/latest/download/openchamber-queue-latest.zip`
+   - 最新 **Releases** 页面上的 `.zip` 文件；
    - 本地克隆的 `dist/` 目录（先执行一次 `npm run build`）；
-   - 最新 **Releases** 页面上的 `.zip`；
    - `release` 分支的 git 地址 ——
-     `https://github.com/<owner>/openchamber-queue.git#release`
+     `https://github.com/open-tecmz/openchamber-queue.git#release`
      （git 安装可在 设置 → 扩展 中 **更新**，依据 `package.json` 版本号升高；
      zip 安装不支持应用内更新，需手动重新添加更新的 zip）。
 3. 在权限对话框中点击 **允许并启用**。它会列出 `prompt`、`sessions`、`service`；
@@ -163,28 +164,6 @@ npm test            # 先构建，再针对 stub OpenChamber 跑隔离端到端�
 宿主不会编译扩展：只发布已构建文件。新增语言只需改 `src/i18n.ts` 并重新构建。这里只使用
 `devDependencies`，仓库不包含 `node_modules`。每次改动都要在 `changelog.md` 中记录
 （规范见 `AGENTS.md`）。
-
-## 目录结构
-
-```
-package.json            扩展清单与脚本
-icon.svg                侧栏图标
-AGENTS.md               仓库规范（changelog 约定）
-changelog.md            各版本的变更记录
-scripts/build.mjs       组装 dist/（可安装包）
-.github/workflows/      CI：构建 dist/，发布 release 分支与 zip
-src/core.ts             队列模型与纯函数 planTick 规则（面板与服务共用）
-src/i18n.ts             各语言的面板文案
-panel/main.ts           面板 + 背景帧      -> dist/panel/main.js
-panel/index.html        侧栏面板页
-panel/background.html   动作与 /queue 的按需页
-service/main.ts         后台 worker        -> dist/service/main.js
-dist/                   构建出的可安装包（生成物，不提交）
-PROPOSAL.md             最初的设计规划
-README.md               英文说明
-README.zh-CN.md         简体中文说明（本文件）
-_temp/                  本地测试脚本（不随包发布）
-```
 
 ## 语言
 

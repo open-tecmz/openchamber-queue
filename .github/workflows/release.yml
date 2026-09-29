@@ -46,19 +46,26 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             echo "title=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "zip=openchamber-queue-${GITHUB_REF_NAME}.zip" >> "$GITHUB_OUTPUT"
+            echo "zip_name=openchamber-queue-${GITHUB_REF_NAME}.zip" >> "$GITHUB_OUTPUT"
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
             echo "title=latest" >> "$GITHUB_OUTPUT"
-            echo "zip=openchamber-queue-latest.zip" >> "$GITHUB_OUTPUT"
+            echo "zip_name=openchamber-queue-latest.zip" >> "$GITHUB_OUTPUT"
           fi
 
       # Zip first, while dist/ is still pristine: the branch step below creates a
       # .git inside dist/, which must not end up in the archive.
+      # NOTE: the env var must NOT be called "ZIP" (nor "ZIPOPT"): Info-ZIP's zip
+      # reads $ZIP / $ZIPOPT as default arguments, which overrides the archive
+      # path and writes the zip into dist/ instead of the workspace root, so the
+      # publish step below then fails with "no matches found for ...".
       - name: Zip package
         env:
-          ZIP: ${{ steps.meta.outputs.zip }}
-        run: (cd dist && zip -qr "../${ZIP}" . -x '.git/*')
+          ZIP_NAME: ${{ steps.meta.outputs.zip_name }}
+        run: |
+          set -euo pipefail
+          (cd dist && zip -qr "../${ZIP_NAME}" . -x '.git/*')
+          ls -l "${ZIP_NAME}"
 
       # Publish the built package as an orphan `release` branch. It replaces the
       # previous build, so the branch has a single commit and no source files.
@@ -83,14 +90,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.meta.outputs.tag }}
           TITLE: ${{ steps.meta.outputs.title }}
-          ZIP: ${{ steps.meta.outputs.zip }}
+          ZIP_NAME: ${{ steps.meta.outputs.zip_name }}
         run: |
           set -euo pipefail
           notes="Built from ${GITHUB_SHA}."
           # --latest: every release, rolling "latest" or a vX.Y.Z tag, becomes Latest.
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" "${ZIP}" --clobber
+            gh release upload "${TAG}" "${ZIP_NAME}" --clobber
             gh release edit "${TAG}" --title "${TITLE}" --notes "${notes}" --latest
           else
-            gh release create "${TAG}" "${ZIP}" --title "${TITLE}" --notes "${notes}" --latest
+            gh release create "${TAG}" "${ZIP_NAME}" --title "${TITLE}" --notes "${notes}" --latest
           fi

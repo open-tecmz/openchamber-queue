@@ -32,7 +32,6 @@ has **no running session**, so the rail stays quiet until there is work to do.
 - [Permissions](#permissions)
 - [Limitations](#limitations)
 - [Development](#development)
-- [Project layout](#project-layout)
 - [Languages](#languages)
 - [License](#license)
 
@@ -92,10 +91,12 @@ OpenChamber **2.0.0 or newer**, web or desktop.
 
 1. **Settings → Extensions**.
 2. Paste one of these into **folder, ZIP or URL** and press **Add**:
+   - the latest packaged zip — this URL always points at the newest build:
+     `https://github.com/open-tecmz/openchamber-queue/releases/latest/download/openchamber-queue-latest.zip`
+   - the `.zip` file from the latest **Releases** page,
    - the `dist/` folder of a local clone (run `npm run build` once first),
-   - the `.zip` from the latest **Releases** page,
    - the git URL of the `release` branch —
-     `https://github.com/<owner>/openchamber-queue.git#release`
+     `https://github.com/open-tecmz/openchamber-queue.git#release`
      (git installs can **Update** from Settings → Extensions when `package.json`
      version increases; a zip install cannot, so re-add the newer zip by hand).
 3. Approve the permission dialog (**Allow and enable**). It lists `prompt`,
@@ -189,28 +190,6 @@ The host never compiles an extension: ship built files only. Editing `src/i18n.t
 and rebuilding is enough to add a language. These are the only `devDependencies`;
 nothing here ships `node_modules`. Record every change in `changelog.md` before you
 finish — the repo rule lives in `AGENTS.md`.
-
-## Project layout
-
-```
-package.json            extension manifest + scripts
-icon.svg                rail icon
-AGENTS.md               repo conventions (the changelog rule)
-changelog.md            notable changes, per release
-scripts/build.mjs       assembles dist/ (the installable package)
-.github/workflows/      CI: build dist/, publish the release branch + zip
-src/core.ts             queue model and the pure planTick rule (shared)
-src/i18n.ts             panel copy per locale
-panel/main.ts           panel + background frame  -> dist/panel/main.js
-panel/index.html        rail panel page
-panel/background.html   on-demand page for actions and /queue
-service/main.ts         background worker         -> dist/service/main.js
-dist/                   built installable package (generated, not committed)
-PROPOSAL.md             original design notes
-README.md               English documentation (this file)
-README.zh-CN.md         简体中文说明
-_temp/                  local test harness (not shipped)
-```
 
 ## Languages
 
