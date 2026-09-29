@@ -18,28 +18,34 @@ import path from 'node:path';
 import {
   ACTIVE_GRACE_MS,
   clearTasks,
-  completeTask,
+  type QueueEvent,
+  type QueueEventType,
+  type QueueSnapshot,
   countTasks,
   deriveTitle,
   editTask,
   emptyState,
   enqueue,
+  finishRun,
+  firstPending,
   getQueue,
   isOccupied,
   markFailed,
-  markRunning,
   moveTask,
   planTick,
   registerProject,
-  releaseTask,
   removeTask,
+  repairQueue,
   retryTask,
   setEnabled,
+  startTask,
+  type ActiveRun,
   type ActiveStatus,
   type ProjectQueue,
   type SessionActivity,
   type QueueState,
   type QueueTask,
+  type TickObservation,
 } from '../src/core.ts';
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT);
@@ -54,6 +60,20 @@ const TICK_MS = 5000;
 const REQUEST_TIMEOUT_MS = 8000;
 const SESSION_LIMIT = 30;
 const MAX_STEPS_PER_TICK = 4;
+
+/**
+ * How long a read of `/events` may hold the connection open waiting for the
+ * first event. A parked reader is not free: the host proxies one
+ * request/response, and a sandboxed panel can only keep a handful of
+ * connections to that origin open, so a long hold lets a few overlapping
+ * readers (a remount, a directory change, a return to the window — the host
+ * cannot cancel a request already in flight) starve every later command behind
+ * them. The hold therefore stays short; a caller that has to wait longer simply
+ * asks again from the cursor it already has, and an event still arrives the
+ * moment it happens because the hold ends as soon as one does.
+ */
+const WAIT_MAX_MS = 2000;
+const WAIT_MIN_MS = 500;
 
 // ---------------------------------------------------------------------------
 // Data directories and persistence
@@ -87,6 +107,9 @@ const readState = async (): Promise<QueueState> => {
     if (!parsed || typeof parsed !== 'object') return emptyState();
     parsed.projects ??= {};
     parsed.queues ??= {};
+    for (const queue of Object.values(parsed.queues)) {
+      if (queue && typeof queue === 'object') repairQueue(queue);
+    }
     return parsed;
   } catch {
     return emptyState();
@@ -107,6 +130,90 @@ const persist = (): Promise<void> => {
   });
   return writeChain;
 };
+
+// ---------------------------------------------------------------------------
+// Events: one ordered log for the whole service, pushed to every subscriber
+// ---------------------------------------------------------------------------
+
+/**
+ * Clients follow the queue as one event stream for the service: `GET /events`
+ * for a batched, cursor-based read (what a sandboxed panel can use, since the
+ * host buffers one request/response and will not stream), and
+ * `GET /events/stream` as real SSE for anything that can hold a connection open
+ * (the CLI, a script, tooling).
+ *
+ * One log, not one per project: a client keeps a single cursor, so opening
+ * another project never costs another reader — and a reader costs a whole
+ * connection, which a sandboxed panel has only a few of. `projectId` on a read
+ * is nothing but a filter for callers that want one project's slice.
+ *
+ * The log is in-memory only. `seq` restarts at 1 with the process, so a client
+ * whose cursor is ahead of the log is told to reset and re-reads the state.
+ */
+type Subscriber = (event: QueueEvent) => void;
+
+const EVENT_LOG_MAX = 100;
+
+const log: QueueEvent[] = [];
+let seq = 0;
+const subscribers = new Set<Subscriber>();
+
+/** The log keeps its own copy: the live queue keeps mutating in place. */
+const snapshotQueue = (queue: ProjectQueue): ProjectQueue =>
+  JSON.parse(JSON.stringify(queue)) as ProjectQueue;
+
+const subscribe = (listener: Subscriber): (() => void) => {
+  subscribers.add(listener);
+  return () => { subscribers.delete(listener); };
+};
+
+/** Append one event and hand it to everyone listening. */
+const emit = (projectId: string, type: QueueEventType): void => {
+  seq += 1;
+  const event: QueueEvent = {
+    seq,
+    at: Date.now(),
+    projectId,
+    type,
+    queue: snapshotQueue(getQueue(state, projectId)),
+  };
+  log.push(event);
+  if (log.length > EVENT_LOG_MAX) log.splice(0, log.length - EVENT_LOG_MAX);
+  for (const listener of [...subscribers]) listener(event);
+};
+
+type EventsRead = { events: QueueEvent[] } | { reset: true };
+
+/**
+ * Everything after `after` (optionally only `projectId`'s entries), or a reset
+ * when the cursor cannot be replayed.
+ */
+const eventsAfter = (after: number, projectId?: string | null): EventsRead => {
+  const oldest = log.length > 0 ? log[0].seq : seq + 1;
+  if (after > seq || after < oldest - 1) return { reset: true };
+  return { events: log.filter((event) => event.seq > after && (!projectId || event.projectId === projectId)) };
+};
+
+/**
+ * The reader that is parked right now, if any.
+ *
+ * A parked reader is not free: it holds a connection from the host to this
+ * process, and the panel that owns it has only a few connections to spend. The
+ * host cannot cancel a request already in flight, so when a panel reloads, the
+ * read its previous document left behind keeps holding until it expires. The
+ * newest reader therefore wins: an older one is answered at once so its
+ * connection frees, but only once it has been parked for a grace period, so a
+ * client that keeps losing its reader (two panels watching at once) backs off
+ * instead of spinning.
+ */
+const PARKED_GRACE_MS = 1000;
+
+type ParkedReader = {
+  at: number;
+  settle: (payload: { events?: QueueEvent[]; superseded?: true } | null) => void;
+};
+
+let parked: ParkedReader | null = null;
 
 // ---------------------------------------------------------------------------
 // Local OpenChamber client (control API + proxied OpenCode session routes)
@@ -293,115 +400,180 @@ const sessionActivity = async (session: any, directory: string): Promise<Session
   return type === 'retry' || type === 'retrying' ? 'retrying' : 'running';
 };
 
-type ProjectObservation = {
-  activityOf: (sessionId: string) => SessionActivity;
-  projectBusy: boolean;
-};
-
-const observeProject = async (directory: string, sessions: any[]): Promise<ProjectObservation> => {
+/**
+ * What the tick needs to know about one project's sessions.
+ *
+ * Only the sessions the decision actually reads are probed. While a run this
+ * queue started is in flight the decision is about that run alone
+ * (`planTick` ignores `projectBusy` then), so probing the rest of the project
+ * would be thrown away. Without one, any busy session decides whether the
+ * project is free, so all of them are probed, together.
+ */
+const observe = async (
+  directory: string,
+  sessions: any[],
+  active: ActiveRun | null,
+): Promise<TickObservation> => {
+  if (active) {
+    return { activeStatus: await activeStatusFor(active, sessions, directory), projectBusy: false };
+  }
   const activities = new Map<string, SessionActivity>();
   const busy = sessions.filter((session) => !session?.archivedAt && !isStatusIdle(session));
   await Promise.all(busy.map(async (session) => {
     activities.set(session.id, await sessionActivity(session, directory));
   }));
   return {
-    activityOf: (sessionId: string) => activities.get(sessionId) ?? 'idle',
+    activeStatus: 'free',
     projectBusy: [...activities.values()].some(isOccupied),
   };
 };
 
-const activeStatusFor = (
-  active: { sessionId: string; startedAt: number },
+/**
+ * Status of the session this queue itself dispatched: `running` while it really
+ * executes, `free` as soon as it is idle, gone, or only waiting on a question.
+ */
+const activeStatusFor = async (
+  active: ActiveRun,
   sessions: any[],
-  observation: ProjectObservation,
-): ActiveStatus => {
+  directory: string,
+): Promise<ActiveStatus> => {
   const session = sessions.find((entry) => entry?.id === active.sessionId);
   if (!session) {
-    // The list may not include a just-created session yet; only call it gone
-    // once past the grace window, so a fresh dispatch is not completed instantly.
-    return Date.now() - active.startedAt < ACTIVE_GRACE_MS ? 'running' : 'gone';
+    // The list may not include a just-created session yet; only call it free
+    // once past the grace window, so a fresh dispatch is not finished instantly.
+    return Date.now() - active.startedAt < ACTIVE_GRACE_MS ? 'running' : 'free';
   }
-  if (session.archivedAt) return 'gone';
-  const activity = observation.activityOf(session.id);
-  if (activity === 'waiting-question') return 'question';
-  return activity === 'idle' ? 'idle' : 'running';
+  if (session.archivedAt) return 'free';
+  // A question does not occupy the project, so it frees the queue as well.
+  return isOccupied(await sessionActivity(session, directory)) ? 'running' : 'free';
 };
 
 // ---------------------------------------------------------------------------
 // Tick
 // ---------------------------------------------------------------------------
 
-let ticking = false;
-
-const dispatch = async (projectId: string, directory: string, task: QueueTask): Promise<void> => {
+const dispatch = async (projectId: string, directory: string, task: QueueTask): Promise<QueueEventType> => {
   const title = deriveTitle(task.text);
   const result = await control('session.create', { directory, prompt: task.text, title });
   if (result.ok && typeof result.body?.sessionId === 'string') {
-    markRunning(state, projectId, task.id, result.body.sessionId);
-    return;
+    startTask(state, projectId, task.id, result.body.sessionId);
+    return 'run.started';
   }
   markFailed(state, projectId, task.id, result.ok ? 'session.create returned no session id' : result.error);
+  return 'task.failed';
+};
+
+/** Create a session for this text right away, bypassing the queue. */
+const runNow = async (projectId: string, text: string): Promise<void> => {
+  const info = state.projects[projectId];
+  const trimmed = text.trim();
+  if (!info || !trimmed) return;
+  const result = await control('session.create', {
+    directory: info.directory,
+    prompt: trimmed,
+    title: deriveTitle(trimmed),
+  });
+  if (!result.ok) console.error('[queue] run-now failed', result.error);
 };
 
 /**
- * One project, one step at a time: completing or releasing the active task
- * frees the project, so we ask again and may dispatch in the same tick.
+ * Whether one queue has anything for the worker to do: a run this queue started
+ * that is still in flight, or a task waiting to start. A queue that is idle,
+ * off, or holds only failed tasks is skipped without a single request — the
+ * worker never asks about a project just because it is registered.
  */
-const runProject = async (projectId: string): Promise<boolean> => {
+const queueHasWork = (queue: ProjectQueue): boolean =>
+  queue.active !== null || (queue.enabled && firstPending(queue) !== null);
+
+/**
+ * One project, one step at a time: finishing the active run frees the project,
+ * so we ask again and may dispatch in the same tick.
+ */
+const runProject = async (projectId: string): Promise<QueueEventType[]> => {
   const info = state.projects[projectId];
-  if (!info) return false;
-  let mutated = false;
+  if (!info) return [];
+  const types: QueueEventType[] = [];
 
   for (let step = 0; step < MAX_STEPS_PER_TICK; step += 1) {
     const queue = getQueue(state, projectId);
-    if (!queue.active && (!queue.enabled || queue.tasks.length === 0)) break;
+    if (!queueHasWork(queue)) break;
 
     const sessions = await listSessions(info.directory);
     if (!sessions) break;
-    const observation = await observeProject(info.directory, sessions);
-    const decision = planTick(queue, {
-      projectBusy: observation.projectBusy,
-      activeStatus: queue.active ? activeStatusFor(queue.active, sessions, observation) : 'idle',
-    });
+    const decision = planTick(queue, await observe(info.directory, sessions, queue.active));
 
     if (decision.kind === 'wait' || decision.kind === 'idle') break;
-    if (decision.kind === 'complete') {
-      completeTask(state, projectId, decision.taskId);
-      mutated = true;
-      continue;
-    }
-    if (decision.kind === 'release') {
-      releaseTask(state, projectId, decision.taskId);
-      mutated = true;
+    if (decision.kind === 'finish') {
+      finishRun(state, projectId);
+      types.push('run.finished');
       continue;
     }
     const task = queue.tasks.find((entry) => entry.id === decision.taskId);
     if (!task) break;
-    await dispatch(projectId, info.directory, task);
-    mutated = true;
+    types.push(await dispatch(projectId, info.directory, task));
     break;
   }
-  return mutated;
+  return types;
 };
 
-const runTick = async (): Promise<boolean> => {
-  let mutated = false;
-  for (const projectId of Object.keys(state.projects)) {
-    if (await runProject(projectId)) mutated = true;
-  }
-  return mutated;
-};
+/**
+ * Evaluate one project and report whether it changed anything. A project already
+ * being evaluated is skipped: two passes over the same queue could both decide
+ * to dispatch its head task. The guard is per project rather than one global
+ * lock, so a command's pass is not held back by the periodic sweep of another
+ * project — and it never queues behind a pass it would then duplicate.
+ */
+const tickingProjects = new Set<string>();
 
-const tick = async (): Promise<void> => {
-  if (ticking) return;
-  ticking = true;
+const tickProject = async (projectId: string): Promise<boolean> => {
+  if (tickingProjects.has(projectId)) return false;
+  tickingProjects.add(projectId);
   try {
-    if (await runTick()) await persist();
-  } catch (error) {
-    console.error('[queue] tick failed', error);
+    const types = await runProject(projectId);
+    for (const type of types) emit(projectId, type);
+    return types.length > 0;
   } finally {
-    ticking = false;
+    tickingProjects.delete(projectId);
   }
+};
+
+/** The registered queues that have something to do, in registration order. */
+const projectsWithWork = (): string[] =>
+  Object.keys(state.projects).filter((projectId) => queueHasWork(getQueue(state, projectId)));
+
+/**
+ * The periodic sweep: whatever has work, because a run may have ended since the
+ * last pass and freed its queue. The work set comes from the queues, not from
+ * the registry: a project with nothing queued is never asked about.
+ */
+const tick = async (): Promise<void> => {
+  let mutated = false;
+  try {
+    for (const projectId of projectsWithWork()) {
+      if (await tickProject(projectId)) mutated = true;
+    }
+  } catch (error) {
+    // One project must not stop the sweep or raise an unhandled rejection.
+    console.error('[queue] tick failed', error);
+  }
+  if (mutated) await persist();
+};
+
+/**
+ * Evaluate one project behind the caller. A panel command answers as soon as it
+ * changed the state; the dispatch it may have made possible runs on from here.
+ * Firing a task starts a session and sends its prompt, which takes seconds, and
+ * a button must not spin for that. The panel follows the event stream, so it
+ * learns the outcome the moment it is known.
+ */
+const evaluateProject = (projectId: string): void => {
+  void (async () => {
+    try {
+      if (await tickProject(projectId)) await persist();
+    } catch (error) {
+      console.error('[queue] tick failed', error);
+    }
+  })();
 };
 
 // ---------------------------------------------------------------------------
@@ -409,7 +581,7 @@ const tick = async (): Promise<void> => {
 // ---------------------------------------------------------------------------
 
 type Command = {
-  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'retry' | 'clear' | 'set-enabled' | 'tick';
+  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'retry' | 'clear' | 'set-enabled' | 'run-now' | 'tick';
   projectId?: string;
   directory?: string;
   name?: string;
@@ -419,14 +591,25 @@ type Command = {
   enabled?: boolean;
 };
 
+/** Which event a command reports once it changed something. */
+const COMMAND_EVENTS: Partial<Record<Command['op'], QueueEventType>> = {
+  register: 'project.registered',
+  enqueue: 'task.enqueued',
+  edit: 'task.edited',
+  remove: 'task.removed',
+  move: 'task.moved',
+  retry: 'task.retried',
+  clear: 'queue.cleared',
+  'set-enabled': 'queue.enabled',
+};
+
 const applyCommand = async (command: Command): Promise<boolean> => {
   const projectId = command.projectId;
   if (!projectId) return false;
   switch (command.op) {
     case 'register':
       if (!command.directory) return false;
-      registerProject(state, { id: projectId, directory: command.directory, name: command.name ?? projectId });
-      return true;
+      return registerProject(state, { id: projectId, directory: command.directory, name: command.name ?? projectId });
     case 'enqueue':
       return enqueue(state, projectId, command.text ?? '') !== null;
     case 'edit':
@@ -441,6 +624,9 @@ const applyCommand = async (command: Command): Promise<boolean> => {
       return clearTasks(state, projectId);
     case 'set-enabled':
       return setEnabled(state, projectId, command.enabled === true);
+    case 'run-now':
+      await runNow(projectId, command.text ?? '');
+      return false;
     case 'tick':
       await tick();
       return false;
@@ -485,13 +671,121 @@ const server = http.createServer((req, res) => {
 
     if (url.pathname === '/state') {
       const projectId = url.searchParams.get('projectId') ?? '';
-      json(res, 200, {
-        backend: true,
-        projectId,
+      const queue = getQueue(state, projectId);
+      const snapshot: QueueSnapshot = {
         project: state.projects[projectId] ?? null,
-        queue: getQueue(state, projectId),
-        counts: summarize(getQueue(state, projectId)),
+        queue,
+        seq,
+      };
+      json(res, 200, { backend: true, projectId, ...snapshot, counts: summarize(queue) });
+      return;
+    }
+
+    /**
+     * The event stream, in batches: everything after `after`, or the events that
+     * arrive while the call is held (up to `wait` ms). One stream for the whole
+     * service — `projectId` only narrows the answer, it does not select a
+     * different log — and it is the shape a sandboxed panel can consume, since
+     * the host buffers one request/response and will not stream.
+     * `/events/stream` below carries the very same events for clients that can.
+     */
+    if (url.pathname === '/events') {
+      const projectId = url.searchParams.get('projectId');
+      const after = Number(url.searchParams.get('after') ?? '0');
+      const requested = Number(url.searchParams.get('wait') ?? WAIT_MAX_MS);
+      const hold = Number.isFinite(requested)
+        ? Math.min(WAIT_MAX_MS, Math.max(WAIT_MIN_MS, requested))
+        : WAIT_MAX_MS;
+
+      const answer = (payload: { events?: QueueEvent[]; reset?: true; superseded?: true }): void => {
+        const queue = getQueue(state, projectId ?? '');
+        json(res, 200, {
+          backend: true,
+          ...(projectId ? { projectId, queue, counts: summarize(queue) } : {}),
+          seq,
+          events: [],
+          ...payload,
+        });
+      };
+
+      // Checked and subscribed without awaiting in between: no event can slip
+      // through the gap and leave the caller parked until the hold expires.
+      const pending = eventsAfter(after, projectId);
+      if ('reset' in pending) {
+        answer({ reset: true });
+        return;
+      }
+      if (pending.events.length > 0) {
+        answer({ events: pending.events });
+        return;
+      }
+
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      let unsubscribe: (() => void) | null = null;
+      const finish = (payload: { events?: QueueEvent[]; superseded?: true } | null): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        unsubscribe?.();
+        if (parked?.settle === finish) parked = null;
+        if (payload) answer(payload);
+      };
+
+      // One parked reader at most: the newest wins, so a reader left behind by a
+      // reloaded or switched panel is dropped instead of holding a connection.
+      if (parked && Date.now() - parked.at >= PARKED_GRACE_MS) {
+        const previous = parked;
+        parked = null;
+        previous.settle({ superseded: true });
+      }
+
+      unsubscribe = subscribe((event) => finish({ events: [event] }));
+      parked = { at: Date.now(), settle: finish };
+      timer = setTimeout(() => finish({}), hold);
+      timer.unref?.();
+      // The panel closing or reloading drops the connection; stop holding then.
+      res.on('close', () => finish(null));
+      return;
+    }
+
+    /** The same events as a real SSE stream, for clients that can hold a socket. */
+    if (url.pathname === '/events/stream') {
+      const projectId = url.searchParams.get('projectId');
+      const after = Number(url.searchParams.get('after') ?? '0');
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
       });
+      res.write('retry: 2000\n\n');
+
+      let unsubscribe: (() => void) | null = null;
+      let heartbeat: NodeJS.Timeout | null = null;
+      const stop = (): void => {
+        unsubscribe?.();
+        unsubscribe = null;
+        if (heartbeat !== null) clearInterval(heartbeat);
+        heartbeat = null;
+      };
+
+      const send = (event: QueueEvent): void => {
+        if (projectId && event.projectId !== projectId) return;
+        res.write(`id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      };
+
+      const pending = eventsAfter(after, projectId);
+      if ('reset' in pending) {
+        const queue = projectId ? getQueue(state, projectId) : null;
+        res.write(`event: reset\ndata: ${JSON.stringify({ seq, ...(queue ? { queue, counts: summarize(queue) } : {}) })}\n\n`);
+      } else {
+        for (const event of pending.events) send(event);
+      }
+      unsubscribe = subscribe(send);
+      heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);
+      heartbeat.unref?.();
+      res.on('close', stop);
       return;
     }
 
@@ -508,16 +802,24 @@ const server = http.createServer((req, res) => {
       const raw = await readBody(req);
       const command = JSON.parse(raw || '{}') as Command;
       const changed = await applyCommand(command);
-      if (command.op !== 'tick') {
-        if (changed) {
-          await persist();
-          // A mutation may make a project dispatchable: evaluate right away so
-          // the panel sees the effect on this response instead of next tick.
-          await tick();
-          await persist();
-        }
+      if (command.op !== 'tick' && changed) {
+        await persist();
+        const type = command.projectId ? COMMAND_EVENTS[command.op] : undefined;
+        if (type && command.projectId) emit(command.projectId, type);
+        // A mutation may make a project dispatchable: evaluate it right away so
+        // the panel does not wait a whole tick — but do it behind this response
+        // (the event stream carries the result), so a click never waits on the
+        // session a dispatch has to create.
+        if (command.projectId) evaluateProject(command.projectId);
       }
-      json(res, 200, { ok: true, queue: command.projectId ? getQueue(state, command.projectId) : undefined });
+      const projectId = command.projectId ?? '';
+      const queue = command.projectId ? getQueue(state, projectId) : null;
+      json(res, 200, {
+        ok: true,
+        seq,
+        queue: queue ?? undefined,
+        counts: queue ? summarize(queue) : undefined,
+      });
       return;
     }
 

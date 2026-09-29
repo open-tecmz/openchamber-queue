@@ -41,10 +41,12 @@ has **no running session**, so the rail stays quiet until there is work to do.
 - **One queue per project** — switching projects switches queues.
 - **Automatic dispatch** — a new session is created and the prompt sent as soon as
   the project is idle; no clicks per task.
-- **Self-cleaning** — a finished task is deleted and counted in *Done*; an empty
-  queue turns its own switch off.
-- **Questions don't block** — if the agent stops to ask a question, that task goes
-  back to the queue and the next one runs.
+- **Run now** — a second button sends the draft into a fresh session at once,
+  without queueing it.
+- **Hand-off queue** — a task is removed and counted in *Done* the moment its
+  session is created; an empty queue turns its own switch off.
+- **Questions don't block** — a session waiting on a question does not hold the
+  project, so the next task is dispatched.
 - **Editable while stopped** — click a task card to edit it in place; edits are
   refused while the queue is running.
 - **Works with the page closed** — the queue is driven by a server-side local
@@ -59,17 +61,17 @@ For each project, every tick:
 
 1. Queue disabled, or empty → nothing to do.
 2. The session this queue started is still **executing** → wait.
-   - If it is **waiting on a question** → the task returns to the queue (at the
-     back) and the next task is dispatched.
 3. Any **other** session in the project is really executing → wait.
 4. Otherwise take the first pending task → create a session → send the content.
-5. When that session goes idle → delete the task, *Done + 1*, continue. When the
-   queue empties, the switch turns itself off.
+   The task leaves the queue and is counted in *Done* right away.
+5. When that session stops executing (idle, gone, or asking a question) the
+   project is free and the next task starts. When the queue empties, the switch
+   turns itself off.
 
 "Really executing" means `running`, `retrying` or `waiting-permission`.
 `waiting-question` is **not** considered occupied, so an agent that is asking a
-question never blocks the queue, while a session you started yourself does make the
-queue wait its turn.
+question never blocks the queue — its task is already handed off — while a session
+you started yourself does make the queue wait its turn.
 
 ### Background vs foreground
 
@@ -103,14 +105,15 @@ OpenChamber **2.0.0 or newer**, web or desktop.
 
 Open the **Queue** panel from the extensions area of the rail:
 
-1. Type a task in the box → **Add to queue**.
+1. Type a task in the box → **Run now** to start a session immediately, or
+   **Add to queue** to line it up.
 2. Turn on **Enable queue**.
 3. Leave it alone. When the project is idle the first task runs; when it finishes
    the next one starts.
 
-The header shows the mode and three counters on the right: **pending / running /
-done**. Each row has *Session*, *Top*, *Retry* (failed only) and *Delete*. With the
-queue stopped, click a row to expand it into an editor with **Save** / **Cancel**.
+The header shows the mode and two counters on the right: **pending / done**. Each
+row has *Top*, *Retry* (failed only) and *Delete*. With the queue stopped, click a
+row to expand it into an editor with **Save** / **Cancel**.
 
 Other ways to add a task:
 
@@ -154,8 +157,9 @@ Uninstalling the extension removes the host-owned foreground storage; delete
 - **Non-public interface** — the service uses the product's own control API and
   proxied OpenCode session routes. These are what the bundled CLI uses, but they are
   not a guest-facing contract and may change between OpenChamber versions.
-- **A failed turn still counts as done** — the queue detects that the session went
-  idle, not whether the agent liked the result. Follow the session link to check.
+- **A task counts as done when it is handed off** — the queue sends the prompt but
+  cannot tell whether the agent succeeded. Check the session in OpenChamber for the
+  result.
 - **Manifest strings are not localizable** — the extension API takes a fixed panel
   name, command description and action label, so they stay in the declared language
   while the panel itself follows OpenChamber's.

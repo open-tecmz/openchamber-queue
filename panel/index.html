@@ -23,6 +23,22 @@
         gap: 10px;
         overflow: hidden;
       }
+      /* The controls (header, banner, switch, composer) keep their natural
+         height and share the leftover space with the list, which is the only
+         region that grows. When the panel is too short for both, the controls
+         scroll instead of pushing the footer past the bottom edge, so "clear
+         queue" is always visible. */
+      .qx-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        flex: 0 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+      }
+      .qx-switch {
+        flex: none;
+      }
       .qx-header {
         display: flex;
         flex-direction: column;
@@ -59,10 +75,14 @@
       }
       .qx-composer-actions {
         display: flex;
+        gap: 8px;
         justify-content: flex-end;
       }
       .qx-list {
-        flex: 1 1 auto;
+        /* The queue is the region that gives and takes: a large shrink factor
+           makes it absorb every layout change (a longer switch hint, a growing
+           composer) before the controls above are allowed to shrink. */
+        flex: 1 100 auto;
         min-height: 0;
         overflow: auto;
         display: flex;
@@ -144,6 +164,43 @@
         display: flex;
         gap: 8px;
         flex: none;
+      }
+      /* First paint, before the queue has been read. */
+      .qx-loading {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* A user-driven request is in flight: a slim bar at the very top. The bar
+         sits outside #root so a re-render never disturbs it. */
+      .qx-busy {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 2px;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 10;
+      }
+      .qx-busy::before {
+        content: "";
+        display: block;
+        width: 40%;
+        height: 100%;
+        border-radius: 9999px;
+        background: var(--oc-primary);
+        animation: qx-busy-slide 900ms ease-in-out infinite;
+      }
+      @keyframes qx-busy-slide {
+        from {
+          transform: translateX(-100%);
+        }
+        to {
+          transform: translateX(350%);
+        }
       }
     </style>
   </head>

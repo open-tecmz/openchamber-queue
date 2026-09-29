@@ -5,33 +5,32 @@
  * local service (Node ESM), so the queue behaves identically whether the panel
  * or the background worker is driving it.
  *
- * Statuses are only pending / running / failed: a finished task is deleted
- * from the queue and counted in `completed` instead.
+ * Statuses are only pending / failed: a task leaves the queue the moment its
+ * session is created and is counted in `completed`. The dispatched session is
+ * remembered as the active run only so nothing else starts while it works.
  */
 
-export type TaskStatus = 'pending' | 'running' | 'failed';
+export type TaskStatus = 'pending' | 'failed';
 
 export type QueueTask = {
   id: string;
   /** The prompt. The only user-authored field. */
   text: string;
   status: TaskStatus;
-  sessionId: string | null;
   createdAt: number;
-  startedAt: number | null;
   finishedAt: number | null;
   error: string | null;
 };
 
+/** The session the queue itself started, remembered until the project is free. */
 export type ActiveRun = {
-  taskId: string;
   sessionId: string;
   startedAt: number;
 };
 
 export type ProjectQueue = {
   enabled: boolean;
-  /** Completions so far. Finished tasks are removed, so this is the running total. */
+  /** Handed-off tasks so far. Tasks are removed at dispatch, so this is the running total. */
   completed: number;
   tasks: QueueTask[];
   active: ActiveRun | null;
@@ -99,9 +98,7 @@ export const makeTask = (text: string, now = Date.now()): QueueTask => ({
   id: nextId(),
   text: text.trim(),
   status: 'pending',
-  sessionId: null,
   createdAt: now,
-  startedAt: null,
   finishedAt: null,
   error: null,
 });
@@ -119,7 +116,6 @@ export const removeTask = (state: QueueState, projectId: string, taskId: string)
   if (!queue) return false;
   const before = queue.tasks.length;
   queue.tasks = queue.tasks.filter((task) => task.id !== taskId);
-  if (queue.active?.taskId === taskId) queue.active = null;
   normalizeQueue(queue);
   return queue.tasks.length !== before;
 };
@@ -161,8 +157,6 @@ export const retryTask = (state: QueueState, projectId: string, taskId: string, 
   const task = state.queues[projectId]?.tasks.find((entry) => entry.id === taskId);
   if (!task) return false;
   task.status = 'pending';
-  task.sessionId = null;
-  task.startedAt = null;
   task.finishedAt = null;
   task.error = null;
   task.createdAt = now;
@@ -182,7 +176,17 @@ export const setEnabled = (state: QueueState, projectId: string, enabled: boolea
   return true;
 };
 
+/**
+ * Remember a project and its queue. Returns false when this project was already
+ * known under the same name and directory and its queue exists, so a caller can
+ * skip a state write and a tick that would change nothing — the panel
+ * re-registers on every mount, and that must not cost anything.
+ */
 export const registerProject = (state: QueueState, project: ProjectInfo): boolean => {
+  const known = state.projects[project.id];
+  if (known?.directory === project.directory && known?.name === project.name && state.queues[project.id]) {
+    return false;
+  }
   state.projects[project.id] = { ...project };
   ensureQueue(state, project.id);
   return true;
@@ -191,7 +195,12 @@ export const registerProject = (state: QueueState, project: ProjectInfo): boolea
 export const firstPending = (queue: ProjectQueue): QueueTask | null =>
   queue.tasks.find((task) => task.status === 'pending') ?? null;
 
-export const markRunning = (
+/**
+ * Hand a task over to a session: it leaves the queue at once (counted as done),
+ * and the session is remembered as the active run so nothing else starts while
+ * it is really executing.
+ */
+export const startTask = (
   state: QueueState,
   projectId: string,
   taskId: string,
@@ -201,22 +210,18 @@ export const markRunning = (
   const queue = state.queues[projectId];
   const task = queue?.tasks.find((entry) => entry.id === taskId);
   if (!queue || !task) return;
-  task.status = 'running';
-  task.sessionId = sessionId;
-  task.startedAt = now;
-  task.error = null;
-  queue.active = { taskId, sessionId, startedAt: now };
-};
-
-/** A finished task is deleted, not kept: only the running total remains. */
-export const completeTask = (state: QueueState, projectId: string, taskId: string, now = Date.now()): void => {
-  const queue = state.queues[projectId];
-  const task = queue?.tasks.find((entry) => entry.id === taskId);
-  if (!queue || !task) return;
-  task.finishedAt = now;
   queue.tasks = queue.tasks.filter((entry) => entry.id !== taskId);
   queue.completed += 1;
-  if (queue.active?.taskId === taskId) queue.active = null;
+  queue.active = { sessionId, startedAt: now };
+  // Deliberately not normalized here: an empty queue stays enabled while the
+  // dispatched session runs, and turns itself off in finishRun.
+};
+
+/** The active session is no longer executing: the project is free again. */
+export const finishRun = (state: QueueState, projectId: string): void => {
+  const queue = state.queues[projectId];
+  if (!queue?.active) return;
+  queue.active = null;
   normalizeQueue(queue);
 };
 
@@ -227,25 +232,6 @@ export const markFailed = (state: QueueState, projectId: string, taskId: string,
   task.status = 'failed';
   task.finishedAt = now;
   task.error = error;
-  if (queue.active?.taskId === taskId) queue.active = null;
-};
-
-/**
- * The agent is waiting for the user to answer a question: the task is treated
- * as pending again and put at the back of the line, so the next task can run.
- */
-export const releaseTask = (state: QueueState, projectId: string, taskId: string): void => {
-  const queue = state.queues[projectId];
-  const task = queue?.tasks.find((entry) => entry.id === taskId);
-  if (!queue || !task) return;
-  task.status = 'pending';
-  task.sessionId = null;
-  task.startedAt = null;
-  task.finishedAt = null;
-  task.error = null;
-  queue.tasks = queue.tasks.filter((entry) => entry.id !== taskId);
-  queue.tasks.push(task);
-  if (queue.active?.taskId === taskId) queue.active = null;
 };
 
 /** Activity of one session, as the host computes it. */
@@ -255,8 +241,11 @@ export type SessionActivity = 'unknown' | 'idle' | 'running' | 'retrying' | 'wai
 export const isOccupied = (activity: SessionActivity): boolean =>
   activity === 'running' || activity === 'retrying' || activity === 'waiting-permission';
 
-/** Status of the session this queue itself dispatched. */
-export type ActiveStatus = 'running' | 'idle' | 'gone' | 'question';
+/**
+ * Status of the session this queue itself dispatched: `running` while it really
+ * executes, `free` as soon as it is idle, gone, or only waiting on a question.
+ */
+export type ActiveStatus = 'running' | 'free';
 
 export type TickObservation = {
   /** True when any non-archived session in the project is occupied. */
@@ -267,23 +256,19 @@ export type TickObservation = {
 export type TickDecision =
   | { kind: 'wait' }
   | { kind: 'idle' }
-  | { kind: 'complete'; taskId: string }
-  | { kind: 'release'; taskId: string }
+  | { kind: 'finish' }
   | { kind: 'dispatch'; taskId: string };
 
 /**
  * What the worker should do next for one project. Pure: callers own the clock
  * and the session list, so both drivers share one rule set.
  *
- * A decision that frees the project (`complete` / `release`) is applied by the
- * caller, which then asks again — that is how a finished task is followed by
- * the next dispatch in the same tick.
+ * A `finish` decision is applied by the caller, which then asks again — that is
+ * how the freed project reaches the next dispatch in the same tick.
  */
 export const planTick = (queue: ProjectQueue, observation: TickObservation): TickDecision => {
   if (queue.active) {
-    if (observation.activeStatus === 'running') return { kind: 'wait' };
-    if (observation.activeStatus === 'question') return { kind: 'release', taskId: queue.active.taskId };
-    return { kind: 'complete', taskId: queue.active.taskId };
+    return observation.activeStatus === 'running' ? { kind: 'wait' } : { kind: 'finish' };
   }
   if (observation.projectBusy) return { kind: 'wait' };
   const next = firstPending(queue);
@@ -292,24 +277,72 @@ export const planTick = (queue: ProjectQueue, observation: TickObservation): Tic
 
 export type QueueCounts = {
   pending: number;
-  running: number;
   failed: number;
   completed: number;
 };
 
 export const countTasks = (queue: ProjectQueue): QueueCounts => {
-  const counts: QueueCounts = { pending: 0, running: 0, failed: 0, completed: queue.completed };
+  const counts: QueueCounts = { pending: 0, failed: 0, completed: queue.completed };
   for (const task of queue.tasks) {
     if (task.status === 'pending') counts.pending += 1;
-    else if (task.status === 'running') counts.running += 1;
     else if (task.status === 'failed') counts.failed += 1;
   }
   return counts;
 };
 
+/**
+ * Bring a queue loaded from disk up to the current schema: tasks from an older
+ * `running` status are dropped (their session is still tracked by `active`).
+ */
+export const repairQueue = (queue: ProjectQueue): ProjectQueue => {
+  queue.tasks = (queue.tasks ?? []).filter((task) => task?.status === 'pending' || task?.status === 'failed');
+  queue.completed = typeof queue.completed === 'number' && Number.isFinite(queue.completed) ? queue.completed : 0;
+  if (queue.active && typeof queue.active.sessionId !== 'string') queue.active = null;
+  return queue;
+};
+
+/**
+ * What a queue did. The service reports every change as one of these, in order,
+ * so a client follows events instead of asking for state on a timer.
+ */
+export type QueueEventType =
+  | 'project.registered'
+  | 'queue.enabled'
+  | 'queue.cleared'
+  | 'task.enqueued'
+  | 'task.edited'
+  | 'task.removed'
+  | 'task.moved'
+  | 'task.retried'
+  | 'run.started'
+  | 'run.finished'
+  | 'task.failed';
+
+/**
+ * One entry in the service's event log. The log is one stream for the whole
+ * service, not one per project: a client follows a single cursor, so opening a
+ * different project never costs another reader. Each entry names its project and
+ * carries that project's whole queue as it stands after the change, so a client
+ * that missed earlier entries is still correct: the sequence number orders
+ * events, it does not make them a delta.
+ */
+export type QueueEvent = {
+  seq: number;
+  at: number;
+  projectId: string;
+  type: QueueEventType;
+  queue: ProjectQueue;
+};
+
+/** What a client needs to start following: one project's state plus the cursor. */
+export type QueueSnapshot = {
+  project: ProjectInfo | null;
+  queue: ProjectQueue;
+  seq: number;
+};
+
 /** Short string used for storage keys, where a raw project id can be too long. */
-export const hashKey = (value: string): string => {
-  let hash = 5381;
+export const hashKey = (value: string): string => {  let hash = 5381;
   for (let index = 0; index < value.length; index += 1) {
     hash = ((hash << 5) + hash + value.charCodeAt(index)) >>> 0;
   }
