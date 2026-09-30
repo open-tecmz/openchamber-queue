@@ -1,0 +1,205 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="light dark" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        background: var(--oc-bg);
+        color: var(--oc-fg);
+        font: 13px/1.5 var(--oc-font, system-ui, sans-serif);
+      }
+      #root {
+        height: 100%;
+        box-sizing: border-box;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        overflow: hidden;
+      }
+      /* The controls (header, banner, switch, composer) keep their natural
+         height and share the leftover space with the list, which is the only
+         region that grows. When the panel is too short for both, the controls
+         scroll instead of pushing the list past the bottom edge. */
+      .qx-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        flex: 0 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+      }
+      .qx-switch {
+        flex: none;
+      }
+      .qx-header {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        flex: none;
+      }
+      .qx-title-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .qx-title {
+        font-weight: 650;
+        font-size: 14px;
+      }
+      .qx-project {
+        color: var(--oc-muted);
+        font-size: 12px;
+        word-break: break-all;
+      }
+      .qx-counts {
+        margin-left: auto;
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .qx-composer {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        flex: none;
+      }
+      .qx-composer-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-start;
+      }
+      .qx-list {
+        /* The queue is the region that gives and takes: a large shrink factor
+           makes it absorb every layout change (a longer switch hint, a growing
+           composer) before the controls above are allowed to shrink. */
+        flex: 1 100 auto;
+        min-height: 0;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--oc-border);
+        border-radius: var(--oc-radius, 8px);
+      }
+      .qx-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+      }
+      .qx-row + .qx-row,
+      .qx-row + .qx-edit,
+      .qx-edit + .qx-row,
+      .qx-edit + .qx-edit {
+        border-top: 1px solid var(--oc-border);
+      }
+      .qx-row-editable {
+        cursor: pointer;
+      }
+      .qx-row-editable:hover {
+        background: var(--oc-hover);
+      }
+      .qx-row-body {
+        flex: 1;
+        min-width: 0;
+      }
+      .qx-row-text {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .qx-row-sub {
+        color: var(--oc-muted);
+        font-size: 11px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .qx-row-actions {
+        display: flex;
+        gap: 4px;
+        flex: none;
+      }
+      .qx-pos {
+        color: var(--oc-muted);
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+        min-width: 16px;
+        text-align: right;
+      }
+      .qx-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex: none;
+        background: var(--oc-muted);
+      }
+      .qx-dot-running {
+        background: var(--oc-primary);
+      }
+      .qx-dot-failed {
+        background: var(--oc-error);
+      }
+      .qx-edit {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+      }
+      .qx-edit-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+      /* First paint, before the queue has been read. */
+      .qx-loading {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* A user-driven request is in flight: a slim bar at the very top. The bar
+         sits outside #root so a re-render never disturbs it. */
+      .qx-busy {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 2px;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 10;
+      }
+      .qx-busy::before {
+        content: "";
+        display: block;
+        width: 40%;
+        height: 100%;
+        border-radius: 9999px;
+        background: var(--oc-primary);
+        animation: qx-busy-slide 900ms ease-in-out infinite;
+      }
+      @keyframes qx-busy-slide {
+        from {
+          transform: translateX(-100%);
+        }
+        to {
+          transform: translateX(350%);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="main.js"></script>
+  </body>
+</html>
