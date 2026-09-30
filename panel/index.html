@@ -26,8 +26,7 @@
       /* The controls (header, banner, switch, composer) keep their natural
          height and share the leftover space with the list, which is the only
          region that grows. When the panel is too short for both, the controls
-         scroll instead of pushing the footer past the bottom edge, so "clear
-         queue" is always visible. */
+         scroll instead of pushing the list past the bottom edge. */
       .qx-controls {
         display: flex;
         flex-direction: column;
@@ -76,7 +75,7 @@
       .qx-composer-actions {
         display: flex;
         gap: 8px;
-        justify-content: flex-end;
+        justify-content: flex-start;
       }
       .qx-list {
         /* The queue is the region that gives and takes: a large shrink factor
@@ -159,11 +158,6 @@
         display: flex;
         gap: 8px;
         justify-content: flex-end;
-      }
-      .qx-footer {
-        display: flex;
-        gap: 8px;
-        flex: none;
       }
       /* First paint, before the queue has been read. */
       .qx-loading {

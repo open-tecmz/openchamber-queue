@@ -54,6 +54,17 @@ export const STATE_VERSION = 1;
 /** A dispatched session is "gone" only after the list has had time to catch up. */
 export const ACTIVE_GRACE_MS = 15000;
 
+/**
+ * How long a project must stay free before the queue starts the next task.
+ *
+ * The queue lets the project settle first: nothing is dispatched until it has
+ * been free for this whole window. Anything that wakes up inside the window —
+ * another session, a permission retry, a follow-up on the session that just
+ * finished — makes the count start over, so the next task only runs once the
+ * project really is quiet.
+ */
+export const DISPATCH_DELAY_MS = 10000;
+
 export const emptyState = (): QueueState => ({
   version: STATE_VERSION,
   projects: {},
@@ -251,6 +262,13 @@ export type TickObservation = {
   /** True when any non-archived session in the project is occupied. */
   projectBusy: boolean;
   activeStatus: ActiveStatus;
+  /**
+   * How long the project has been continuously free — no queue run in flight
+   * and no occupied session — in milliseconds. The queue waits out
+   * `DISPATCH_DELAY_MS` of this before it starts the next task, so a session
+   * that wakes up inside the window resets the count.
+   */
+  idleMs: number;
 };
 
 export type TickDecision =
@@ -271,6 +289,10 @@ export const planTick = (queue: ProjectQueue, observation: TickObservation): Tic
     return observation.activeStatus === 'running' ? { kind: 'wait' } : { kind: 'finish' };
   }
   if (observation.projectBusy) return { kind: 'wait' };
+  // Let the project settle before the next task: only a project that has been
+  // free for the whole window counts, so anything that wakes up inside it pushes
+  // the next dispatch out to a fresh window.
+  if (observation.idleMs < DISPATCH_DELAY_MS) return { kind: 'wait' };
   const next = firstPending(queue);
   return next ? { kind: 'dispatch', taskId: next.id } : { kind: 'idle' };
 };

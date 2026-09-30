@@ -17,6 +17,7 @@ import path from 'node:path';
 
 import {
   ACTIVE_GRACE_MS,
+  DISPATCH_DELAY_MS,
   clearTasks,
   type QueueEvent,
   type QueueEventType,
@@ -413,7 +414,7 @@ const observe = async (
   directory: string,
   sessions: any[],
   active: ActiveRun | null,
-): Promise<TickObservation> => {
+): Promise<Omit<TickObservation, 'idleMs'>> => {
   if (active) {
     return { activeStatus: await activeStatusFor(active, sessions, directory), projectBusy: false };
   }
@@ -463,6 +464,21 @@ const dispatch = async (projectId: string, directory: string, task: QueueTask): 
   return 'task.failed';
 };
 
+/**
+ * Run one queued task right away: it is dispatched exactly like the scheduler
+ * would dispatch it, just without waiting for the project to be free. On success
+ * it leaves the queue at once (counted in `completed`, its session remembered as
+ * the active run); on failure it stays as a failed task.
+ */
+const runTask = async (projectId: string, taskId: string): Promise<void> => {
+  const info = state.projects[projectId];
+  const task = getQueue(state, projectId).tasks.find((entry) => entry.id === taskId);
+  if (!info || !task) return;
+  const type = await dispatch(projectId, info.directory, task);
+  await persist();
+  emit(projectId, type);
+};
+
 /** Create a session for this text right away, bypassing the queue. */
 const runNow = async (projectId: string, text: string): Promise<void> => {
   const info = state.projects[projectId];
@@ -486,6 +502,54 @@ const queueHasWork = (queue: ProjectQueue): boolean =>
   queue.active !== null || (queue.enabled && firstPending(queue) !== null);
 
 /**
+ * A project's idle clock: the moment it was last seen free, or absent while it
+ * is occupied. The queue waits out `DISPATCH_DELAY_MS` of it before the next
+ * dispatch, so this is where the settle window is measured from.
+ */
+const freeSince = new Map<string, number>();
+
+/** The dispatch checks armed for a project, so an idle clock only has one. */
+const dispatchChecks = new Map<string, NodeJS.Timeout>();
+
+const cancelDispatchCheck = (projectId: string): void => {
+  const timer = dispatchChecks.get(projectId);
+  if (timer) clearTimeout(timer);
+  dispatchChecks.delete(projectId);
+};
+
+/**
+ * Advance this project's idle clock. `free` means neither the queue's own run
+ * nor any other session is executing; when false the clock is forgotten so the
+ * next window starts from zero.
+ */
+const trackIdle = (projectId: string, free: boolean, now: number): number => {
+  if (!free) {
+    freeSince.delete(projectId);
+    return 0;
+  }
+  const since = freeSince.get(projectId) ?? now;
+  freeSince.set(projectId, since);
+  return now - since;
+};
+
+/**
+ * Re-evaluate this project the moment its settle window is up, so the next task
+ * starts right after `DISPATCH_DELAY_MS` rather than at the next periodic tick.
+ */
+const scheduleDispatchCheck = (projectId: string): void => {
+  const since = freeSince.get(projectId);
+  if (since === undefined) return;
+  const delayMs = Math.max(0, since + DISPATCH_DELAY_MS - Date.now());
+  cancelDispatchCheck(projectId);
+  const timer = setTimeout(() => {
+    dispatchChecks.delete(projectId);
+    evaluateProject(projectId);
+  }, delayMs);
+  timer.unref?.();
+  dispatchChecks.set(projectId, timer);
+};
+
+/**
  * One project, one step at a time: finishing the active run frees the project,
  * so we ask again and may dispatch in the same tick.
  */
@@ -494,23 +558,39 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
   if (!info) return [];
   const types: QueueEventType[] = [];
 
+  if (!queueHasWork(getQueue(state, projectId))) {
+    // Nothing queued: the settle window only starts once there is work to run.
+    freeSince.delete(projectId);
+    cancelDispatchCheck(projectId);
+    return types;
+  }
+
   for (let step = 0; step < MAX_STEPS_PER_TICK; step += 1) {
     const queue = getQueue(state, projectId);
     if (!queueHasWork(queue)) break;
 
     const sessions = await listSessions(info.directory);
     if (!sessions) break;
-    const decision = planTick(queue, await observe(info.directory, sessions, queue.active));
+    const observation = await observe(info.directory, sessions, queue.active);
+    const now = Date.now();
+    const free = queue.active === null && !observation.projectBusy;
+    const decision = planTick(queue, { ...observation, idleMs: trackIdle(projectId, free, now) });
 
-    if (decision.kind === 'wait' || decision.kind === 'idle') break;
     if (decision.kind === 'finish') {
       finishRun(state, projectId);
       types.push('run.finished');
       continue;
     }
-    const task = queue.tasks.find((entry) => entry.id === decision.taskId);
-    if (!task) break;
-    types.push(await dispatch(projectId, info.directory, task));
+    if (decision.kind === 'dispatch') {
+      cancelDispatchCheck(projectId);
+      const task = queue.tasks.find((entry) => entry.id === decision.taskId);
+      if (!task) break;
+      types.push(await dispatch(projectId, info.directory, task));
+      break;
+    }
+    // Waiting on the settle window (or occupied): re-check when it is up.
+    if (free && firstPending(queue)) scheduleDispatchCheck(projectId);
+    else cancelDispatchCheck(projectId);
     break;
   }
   return types;
@@ -581,7 +661,7 @@ const evaluateProject = (projectId: string): void => {
 // ---------------------------------------------------------------------------
 
 type Command = {
-  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'retry' | 'clear' | 'set-enabled' | 'run-now' | 'tick';
+  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'run-now' | 'tick';
   projectId?: string;
   directory?: string;
   name?: string;
@@ -618,6 +698,11 @@ const applyCommand = async (command: Command): Promise<boolean> => {
       return removeTask(state, projectId, command.taskId ?? '');
     case 'move':
       return moveTask(state, projectId, command.taskId ?? '', command.direction ?? 'top');
+    case 'run':
+      // Persists and emits its own event (run.started / task.failed), so it
+      // reports no generic change to the caller.
+      await runTask(projectId, command.taskId ?? '');
+      return false;
     case 'retry':
       return retryTask(state, projectId, command.taskId ?? '');
     case 'clear':

@@ -3,8 +3,8 @@
 # OpenChamber Queue
 
 **A per-project task queue for [OpenChamber](https://openchamber.dev).**
-Add tasks, flip the queue on, and the next task starts on its own whenever the
-project is idle — one task at a time, no clicks per task.
+Add tasks, flip the queue on, and the next task starts on its own once the
+project has been idle for 10 seconds — one task at a time, no clicks per task.
 
 English · [简体中文](./README.zh-CN.md)
 
@@ -17,8 +17,9 @@ English · [简体中文](./README.zh-CN.md)
 </div>
 
 A task has a single field: **the content**, which is the prompt. Model, agent and
-variant come from the project's own defaults. A task starts as soon as that project
-has **no running session**, so the rail stays quiet until there is work to do.
+variant come from the project's own defaults. A task starts once that project has
+had **no running session for 10 seconds**, so the rail stays quiet until there is
+work to do.
 
 > Built as an OpenChamber **extension** (panel + local service), not an OpenCode plugin.
 
@@ -38,10 +39,12 @@ has **no running session**, so the rail stays quiet until there is work to do.
 ## Features
 
 - **One queue per project** — switching projects switches queues.
-- **Automatic dispatch** — a new session is created and the prompt sent as soon as
-  the project is idle; no clicks per task.
+- **Automatic dispatch** — a new session is created and the prompt sent once the
+  project has been idle for 10 seconds; no clicks per task.
 - **Run now** — a second button sends the draft into a fresh session at once,
   without queueing it.
+- **Run a queued task now** — each row has a *Run* button that starts that
+  task's session immediately and removes it from the queue, counting it in *Done*.
 - **Hand-off queue** — a task is removed and counted in *Done* the moment its
   session is created; an empty queue turns its own switch off.
 - **Questions don't block** — a session waiting on a question does not hold the
@@ -61,11 +64,18 @@ For each project, every tick:
 1. Queue disabled, or empty → nothing to do.
 2. The session this queue started is still **executing** → wait.
 3. Any **other** session in the project is really executing → wait.
-4. Otherwise take the first pending task → create a session → send the content.
-   The task leaves the queue and is counted in *Done* right away.
-5. When that session stops executing (idle, gone, or asking a question) the
-   project is free and the next task starts. When the queue empties, the switch
-   turns itself off.
+4. The project must then stay free for **10 seconds**. Anything that wakes up
+   inside that window — a session you start, a retry on the session that just
+   finished — resets the count, so the project has a moment to settle.
+5. Take the first pending task → create a session → send the content. The task
+   leaves the queue and is counted in *Done* right away. The 10-second window
+   starts over before the task after it.
+6. When that session stops executing (idle, gone, or asking a question) the
+   project is free again and the window restarts. When the queue empties, the
+   switch turns itself off.
+
+The 10-second window applies to the first task too: turning the switch on with a
+task waiting starts it 10 seconds later, not instantly.
 
 "Really executing" means `running`, `retrying` or `waiting-permission`.
 `waiting-question` is **not** considered occupied, so an agent that is asking a
@@ -109,12 +119,14 @@ Open the **Queue** panel from the extensions area of the rail:
 1. Type a task in the box → **Run now** to start a session immediately, or
    **Add to queue** to line it up.
 2. Turn on **Enable queue**.
-3. Leave it alone. When the project is idle the first task runs; when it finishes
-   the next one starts.
+3. Leave it alone. Once the project has been idle for 10 seconds the first task
+   runs; when it finishes the next one starts.
 
 The header shows the mode and two counters on the right: **pending / done**. Each
-row has *Top*, *Retry* (failed only) and *Delete*. With the queue stopped, click a
-row to expand it into an editor with **Save** / **Cancel**.
+row has *Run*, *Top*, *Retry* (failed only) and *Delete*. *Run* starts that task's
+session immediately and removes it from the queue, without waiting for the project
+to be idle. With the queue stopped, click a row to expand it into an editor with
+**Save** / **Cancel**.
 
 Other ways to add a task:
 

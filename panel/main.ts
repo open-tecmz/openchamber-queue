@@ -38,6 +38,7 @@ import {
 
 import {
   ACTIVE_GRACE_MS,
+  DISPATCH_DELAY_MS,
   clearTasks,
   countTasks,
   deriveTitle,
@@ -46,6 +47,7 @@ import {
   emptyState,
   ensureQueue,
   finishRun,
+  firstPending,
   getQueue,
   hashKey,
   isOccupied,
@@ -280,6 +282,80 @@ const readSessions = async (projectId: string): Promise<GuestSessionsSnapshot | 
   }
 };
 
+/** Hand one task to a session through the host API, on success or failure alike. */
+const dispatchLocal = async (projectId: string, task: QueueTask): Promise<void> => {
+  try {
+    const result = await host.startSession({
+      providerId: PROVIDER_ID,
+      id: task.id,
+      title: deriveTitle(task.text, t('task.untitled')),
+      url: '',
+      text: task.text,
+      projectId,
+      navigation: 'preserve',
+    });
+    if (result.sessionId && result.sent === 'sent') {
+      startTask(localState, projectId, task.id, result.sessionId);
+    } else if (result.sessionId) {
+      markFailed(localState, projectId, task.id, result.sent === 'no-model' ? t('reason.noModel') : t('reason.sendFailed', { sent: result.sent }));
+    } else {
+      markFailed(localState, projectId, task.id, t('reason.createFailed'));
+    }
+  } catch (error) {
+    markFailed(localState, projectId, task.id, error instanceof Error ? error.message : String(error));
+  }
+};
+
+/**
+ * A project's idle clock for the foreground driver: the moment it was last seen
+ * free, or absent while it is occupied. It mirrors the service's clock so both
+ * drivers wait out the same settle window before the next task.
+ */
+const localFreeSince = new Map<string, number>();
+
+/** The dispatch checks armed per project in the foreground driver. */
+const localDispatchChecks = new Map<string, number>();
+
+const cancelLocalDispatchCheck = (projectId: string): void => {
+  const timer = localDispatchChecks.get(projectId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  localDispatchChecks.delete(projectId);
+};
+
+const trackLocalIdle = (projectId: string, free: boolean, now: number): number => {
+  if (!free) {
+    localFreeSince.delete(projectId);
+    return 0;
+  }
+  const since = localFreeSince.get(projectId) ?? now;
+  localFreeSince.set(projectId, since);
+  return now - since;
+};
+
+/** Re-run the foreground driver for a project once its settle window is up. */
+const scheduleLocalDispatchCheck = (projectId: string): void => {
+  const since = localFreeSince.get(projectId);
+  if (since === undefined) return;
+  const delayMs = Math.max(0, since + DISPATCH_DELAY_MS - Date.now());
+  cancelLocalDispatchCheck(projectId);
+  const timer = window.setTimeout(() => {
+    localDispatchChecks.delete(projectId);
+    void localDrive(projectId);
+  }, delayMs);
+  localDispatchChecks.set(projectId, timer);
+};
+
+/**
+ * One pass of the foreground driver for one project: evaluate the queue and, if
+ * a session was created, save and re-render. Shared by the session listener, the
+ * safety tick and the settle-window check.
+ */
+const localDrive = async (projectId: string, pushed?: GuestSessionsSnapshot | null): Promise<void> => {
+  if (mode !== 'local' || project?.id !== projectId) return;
+  if (await localTick(projectId, pushed)) await saveQueue(projectId);
+  await refresh();
+};
+
 const localTick = async (projectId: string, pushed?: GuestSessionsSnapshot | null): Promise<boolean> => {
   const info = localState.projects[projectId];
   if (!info) return false;
@@ -287,7 +363,12 @@ const localTick = async (projectId: string, pushed?: GuestSessionsSnapshot | nul
 
   for (let step = 0; step < MAX_STEPS_PER_TICK; step += 1) {
     const current = getQueue(localState, projectId);
-    if (!current.active && (!current.enabled || current.tasks.length === 0)) break;
+    if (!current.active && (!current.enabled || current.tasks.length === 0)) {
+      // Nothing queued: the settle window only starts once there is work to run.
+      localFreeSince.delete(projectId);
+      cancelLocalDispatchCheck(projectId);
+      break;
+    }
 
     // The first pass can reuse the snapshot the host just pushed; a later pass
     // needs a fresh one to see a session we created a moment ago.
@@ -296,41 +377,32 @@ const localTick = async (projectId: string, pushed?: GuestSessionsSnapshot | nul
     if (snapshot?.state !== 'ready') break;
     const sessions = (snapshot.sessions ?? []).filter((session) => session.archivedAt === null);
 
-    const decision = planTick(current, {
+    const observation = {
       projectBusy: sessions.some((session) => isOccupied(session.activity as SessionActivity)),
-      activeStatus: current.active ? activeStatusFor(current.active, sessions) : 'free',
-    });
+      activeStatus: current.active ? activeStatusFor(current.active, sessions) : ('free' as ActiveStatus),
+    };
+    const now = Date.now();
+    const free = current.active === null && !observation.projectBusy;
+    const decision = planTick(current, { ...observation, idleMs: trackLocalIdle(projectId, free, now) });
 
-    if (decision.kind === 'wait' || decision.kind === 'idle') break;
     if (decision.kind === 'finish') {
       finishRun(localState, projectId);
       mutated = true;
       continue;
     }
 
-    const task = current.tasks.find((entry) => entry.id === decision.taskId);
-    if (!task) break;
-    try {
-      const result = await host.startSession({
-        providerId: PROVIDER_ID,
-        id: task.id,
-        title: deriveTitle(task.text, t('task.untitled')),
-        url: '',
-        text: task.text,
-        projectId,
-        navigation: 'preserve',
-      });
-      if (result.sessionId && result.sent === 'sent') {
-        startTask(localState, projectId, task.id, result.sessionId);
-      } else if (result.sessionId) {
-        markFailed(localState, projectId, task.id, result.sent === 'no-model' ? t('reason.noModel') : t('reason.sendFailed', { sent: result.sent }));
-      } else {
-        markFailed(localState, projectId, task.id, t('reason.createFailed'));
-      }
-    } catch (error) {
-      markFailed(localState, projectId, task.id, error instanceof Error ? error.message : String(error));
+    if (decision.kind === 'dispatch') {
+      cancelLocalDispatchCheck(projectId);
+      const task = current.tasks.find((entry) => entry.id === decision.taskId);
+      if (!task) break;
+      await dispatchLocal(projectId, task);
+      mutated = true;
+      break;
     }
-    mutated = true;
+
+    // Waiting on the settle window (or occupied): re-check when it is up.
+    if (free && firstPending(current)) scheduleLocalDispatchCheck(projectId);
+    else cancelLocalDispatchCheck(projectId);
     break;
   }
   return mutated;
@@ -383,6 +455,12 @@ const pushCommand = async (command: Record<string, unknown>): Promise<void> => {
         queue = result.queue;
         seq = result.seq;
       }
+    } else if (command.op === 'run') {
+      // "Run" posts one task now: it is dispatched exactly like the scheduler
+      // would, just without waiting for the project to be free.
+      const task = getQueue(localState, project.id).tasks.find((entry) => entry.id === String(command.taskId));
+      if (task) await dispatchLocal(project.id, task);
+      await saveQueue(project.id);
     } else {
       localCommand(project.id, command);
       await saveQueue(project.id);
@@ -545,6 +623,9 @@ const stopLocalDriver = (): void => {
     window.clearInterval(localSafetyTimer);
     localSafetyTimer = null;
   }
+  for (const timer of localDispatchChecks.values()) window.clearTimeout(timer);
+  localDispatchChecks.clear();
+  localFreeSince.clear();
 };
 
 /**
@@ -617,20 +698,15 @@ const startLocalDriver = async (): Promise<void> => {
   stopLocalDriver();
   if (!project || mode !== 'local') return;
   const projectId = project.id;
-  const drive = async (pushed?: GuestSessionsSnapshot | null): Promise<void> => {
-    if (mode !== 'local' || project?.id !== projectId) return;
-    if (await localTick(projectId, pushed)) await saveQueue(projectId);
-    await refresh();
-  };
   try {
-    sessionUnsubscribe = await host.onSessions(projectId, (snapshot) => void drive(snapshot));
+    sessionUnsubscribe = await host.onSessions(projectId, (snapshot) => void localDrive(projectId, snapshot));
   } catch {
     sessionUnsubscribe = null;
   }
   // The host pushes session changes, but a missed one would stall the queue, so
   // a slow tick is the safety net. This mode is the only driver there is, so it
   // keeps running even while the window is hidden.
-  localSafetyTimer = window.setInterval(() => void drive(), LOCAL_SAFETY_MS);
+  localSafetyTimer = window.setInterval(() => void localDrive(projectId), LOCAL_SAFETY_MS);
 };
 
 /** Point the watcher and the local driver at whichever mode is current. */
@@ -787,7 +863,7 @@ const render = (): void => {
   const counts = countTasks(queue);
 
   // Controls live in a scrollable column so a tight panel shortens it instead of
-  // pushing the footer off the bottom edge; the list below is what flexes.
+  // pushing the list off the bottom edge; the list below is what flexes.
   const controls = root.appendChild(el('div', 'qx-controls'));
   const header = controls.appendChild(el('div', 'qx-header'));
   const titleRow = header.appendChild(el('div', 'qx-title-row'));
@@ -845,6 +921,7 @@ const render = (): void => {
   const runButton = mountButton(composerActions, {
     label: t('composer.runNow'),
     variant: 'outline',
+    size: 'sm',
     onClick: () =>
       withLoading(runButton, async () => {
         if (!draft.trim()) return;
@@ -857,6 +934,7 @@ const render = (): void => {
   disposables.push(runButton);
   const addButton = mountButton(composerActions, {
     label: t('composer.add'),
+    size: 'sm',
     onClick: () =>
       withLoading(addButton, async () => {
         if (!draft.trim()) return;
@@ -878,21 +956,6 @@ const render = (): void => {
   } else {
     queue.tasks.forEach((task, index) => listHost.appendChild(renderTask(task, index + 1)));
   }
-
-  if (!queue.enabled) {
-    const footer = root.appendChild(el('div', 'qx-footer'));
-    const clearButton = mountButton(footer, {
-      label: t('footer.clear'),
-      variant: 'ghost',
-      size: 'sm',
-      onClick: () => {
-        if (queue.tasks.length === 0) return;
-        endEdit();
-        withLoading(clearButton, () => pushCommand({ op: 'clear' }));
-      },
-    });
-    disposables.push(clearButton);
-  }
 };
 
 const renderTask = (task: QueueTask, position: number): HTMLElement => {
@@ -913,6 +976,14 @@ const renderTask = (task: QueueTask, position: number): HTMLElement => {
   const actions = row.appendChild(el('div', 'qx-row-actions'));
   // Buttons must not open the editor.
   actions.addEventListener('click', (event) => event.stopPropagation());
+  // Run this task now: create its session at once and drop it from the queue.
+  const runTaskButton = mountButton(actions, {
+    label: t('row.run'),
+    size: 'xs',
+    variant: 'outline',
+    onClick: () => withLoading(runTaskButton, () => pushCommand({ op: 'run', taskId: task.id })),
+  });
+  disposables.push(runTaskButton);
   if (task.status === 'pending') {
     const topButton = mountButton(actions, {
       label: t('row.top'),
