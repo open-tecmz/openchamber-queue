@@ -23,7 +23,6 @@ import {
   type QueueEventType,
   type QueueSnapshot,
   countTasks,
-  deriveTitle,
   editTask,
   emptyState,
   enqueue,
@@ -454,8 +453,12 @@ const activeStatusFor = async (
 // ---------------------------------------------------------------------------
 
 const dispatch = async (projectId: string, directory: string, task: QueueTask): Promise<QueueEventType> => {
-  const title = deriveTitle(task.text);
-  const result = await control('session.create', { directory, prompt: task.text, title });
+  // Deliberately no title: OpenCode only generates a session title from the
+  // first message while the session still carries its default title, so passing
+  // one here would freeze the session to the task's first line and it would
+  // never auto-title. Leaving it out makes a queued run look exactly like a
+  // session started from the UI.
+  const result = await control('session.create', { directory, prompt: task.text });
   if (result.ok && typeof result.body?.sessionId === 'string') {
     startTask(state, projectId, task.id, result.body.sessionId);
     return 'run.started';
@@ -487,7 +490,6 @@ const runNow = async (projectId: string, text: string): Promise<void> => {
   const result = await control('session.create', {
     directory: info.directory,
     prompt: trimmed,
-    title: deriveTitle(trimmed),
   });
   if (!result.ok) console.error('[queue] run-now failed', result.error);
 };

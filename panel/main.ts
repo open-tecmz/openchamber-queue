@@ -282,7 +282,15 @@ const readSessions = async (projectId: string): Promise<GuestSessionsSnapshot | 
   }
 };
 
-/** Hand one task to a session through the host API, on success or failure alike. */
+/**
+ * Hand one task to a session through the host API, on success or failure alike.
+ *
+ * The host session API takes a title and prefixes it with this task id, so a
+ * foreground dispatch cannot leave OpenCode to auto-title the session (that
+ * only happens while a session keeps its default title). The background service
+ * dispatches through the control API and does leave the title out; this path is
+ * only the fallback for when the service is not running.
+ */
 const dispatchLocal = async (projectId: string, task: QueueTask): Promise<void> => {
   try {
     const result = await host.startSession({
