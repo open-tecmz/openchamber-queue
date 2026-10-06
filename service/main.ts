@@ -384,12 +384,40 @@ const hasPending = (result: JsonResult): boolean =>
   result.ok && Array.isArray(result.body?.data) && result.body.data.length > 0;
 
 /**
+ * The sessions in this project that a running shell command belongs to.
+ *
+ * A session that ended its turn but backgrounded a shell command reports idle,
+ * and OpenCode gives it no child session to notice — only the paused turn does.
+ * `GET /api/shell` lists the running commands themselves, each naming its
+ * session, so it is the one signal that says the task is not finished yet. Only
+ * a positive answer adds occupancy: a host without the route, or a failed read,
+ * leaves the check exactly as it was, so an older OpenChamber never stalls.
+ */
+const runningShellSessions = async (directory: string): Promise<Set<string>> => {
+  const result = await serverGet('/api/shell', directory);
+  if (!result.ok) return new Set();
+  const shells = Array.isArray(result.body?.data) ? result.body.data : [];
+  const ids = new Set<string>();
+  for (const shell of shells) {
+    const sessionId = shell?.metadata?.sessionID;
+    if (typeof sessionId === 'string' && sessionId) ids.add(sessionId);
+  }
+  return ids;
+};
+
+/**
  * Activity of one session. The control API only reports busy/idle, so a busy
  * session is probed for a pending permission or question — the same
- * permission-then-form precedence the app uses for its own session list.
+ * permission-then-form precedence the app uses for its own session list. An idle
+ * session is still not finished when a shell it backgrounded is still running,
+ * so that pause is reported as `background`.
  */
-const sessionActivity = async (session: any, directory: string): Promise<SessionActivity> => {
-  if (isStatusIdle(session)) return 'idle';
+const sessionActivity = async (
+  session: any,
+  directory: string,
+  shells: Set<string>,
+): Promise<SessionActivity> => {
+  if (isStatusIdle(session)) return shells.has(session.id) ? 'background' : 'idle';
   const [permission, form] = await Promise.all([
     serverGet(`/api/session/${encodeURIComponent(session.id)}/permission`, directory),
     serverGet(`/api/session/${encodeURIComponent(session.id)}/form`, directory),
@@ -408,34 +436,41 @@ const sessionActivity = async (session: any, directory: string): Promise<Session
  * (`planTick` ignores `projectBusy` then), so probing the rest of the project
  * would be thrown away. Without one, any busy session decides whether the
  * project is free, so all of them are probed, together.
+ *
+ * Running shell commands are read once for the project: a session that
+ * backgrounded one looks idle but is not finished, and it must keep both a run
+ * of the queue's own and any other session from being treated as free.
  */
 const observe = async (
   directory: string,
   sessions: any[],
   active: ActiveRun | null,
 ): Promise<Omit<TickObservation, 'idleMs'>> => {
+  const shells = await runningShellSessions(directory);
   if (active) {
-    return { activeStatus: await activeStatusFor(active, sessions, directory), projectBusy: false };
+    return { activeStatus: await activeStatusFor(active, sessions, directory, shells), projectBusy: false };
   }
   const activities = new Map<string, SessionActivity>();
   const busy = sessions.filter((session) => !session?.archivedAt && !isStatusIdle(session));
   await Promise.all(busy.map(async (session) => {
-    activities.set(session.id, await sessionActivity(session, directory));
+    activities.set(session.id, await sessionActivity(session, directory, shells));
   }));
   return {
     activeStatus: 'free',
-    projectBusy: [...activities.values()].some(isOccupied),
+    projectBusy: [...activities.values()].some(isOccupied) || shells.size > 0,
   };
 };
 
 /**
  * Status of the session this queue itself dispatched: `running` while it really
  * executes, `free` as soon as it is idle, gone, or only waiting on a question.
+ * A backgrounded shell keeps it `running`: the pause is not the end.
  */
 const activeStatusFor = async (
   active: ActiveRun,
   sessions: any[],
   directory: string,
+  shells: Set<string>,
 ): Promise<ActiveStatus> => {
   const session = sessions.find((entry) => entry?.id === active.sessionId);
   if (!session) {
@@ -445,7 +480,7 @@ const activeStatusFor = async (
   }
   if (session.archivedAt) return 'free';
   // A question does not occupy the project, so it frees the queue as well.
-  return isOccupied(await sessionActivity(session, directory)) ? 'running' : 'free';
+  return isOccupied(await sessionActivity(session, directory, shells)) ? 'running' : 'free';
 };
 
 // ---------------------------------------------------------------------------

@@ -26,7 +26,7 @@ work to do.
 ## Contents
 
 - [Features](#features)
-- [How it works](#how-it-works) · [Dispatch rules](#dispatch-rules) · [Background vs foreground](#background-vs-foreground)
+- [How it works](#how-it-works) · [Dispatch rules](#dispatch-rules) · [Background service](#background-service)
 - [Install](#install)
 - [Usage](#usage)
 - [Storage and persistence](#storage-and-persistence)
@@ -80,20 +80,25 @@ task waiting starts it 10 seconds later, not instantly.
 "Really executing" means `running`, `retrying` or `waiting-permission`.
 `waiting-question` is **not** considered occupied, so an agent that is asking a
 question never blocks the queue — its task is already handed off — while a session
-you started yourself does make the queue wait its turn.
+you started yourself does make the queue wait its turn. A session that sent a
+command to the background also counts as executing: it reports idle while the
+command runs, and the queue waits for that command to finish before it moves on.
 
-### Background vs foreground
+### Background service
 
-| Mode | When | Works with the page closed |
-| --- | --- | --- |
-| **Background** (recommended) | The extension's local service is approved and reachable | Yes |
-| **Foreground** | No service grant, or the service is unavailable | No |
-
-Background mode is handled by a Node process the host starts for
+The queue is owned by a Node process the host starts for
 `contributes.service`. It talks to the local OpenChamber control API — the same
 route the bundled `openchamber` CLI uses — to read session state, create sessions
-and send prompts. Foreground mode falls back to host APIs and only runs while a
-panel is open; the panel shows a banner when that happens.
+and send prompts, and it keeps running with no panel or window open.
+
+The panel is only a view onto that service. It does **not** keep a second,
+panel-owned copy of the queue; when the service is not up yet the panel shows a
+connecting state and retries until it answers. Because of that, a task added
+while the service is starting is never written to a store the service cannot
+see — it either reaches the service or the panel says it is still connecting.
+
+The local service must be approved at install time. The queue does not work
+without it; approving it is what lets the queue keep running in the background.
 
 ## Install
 
@@ -137,11 +142,10 @@ Other ways to add a task:
 
 | Data | Location |
 | --- | --- |
-| Queue state (background mode) | `~/.config/openchamber-queue/state.json`, or `$OPENCHAMBER_QUEUE_DATA_DIR/state.json` |
-| Queue state (foreground mode) | host storage, `<OpenChamber data dir>/guest-storage/queue.json` |
+| Queue state | `~/.config/openchamber-queue/state.json`, or `$OPENCHAMBER_QUEUE_DATA_DIR/state.json` |
 | Install record and grants | `<OpenChamber data dir>/extensions.json` |
 
-The background queue keeps its own file *beside* the host's data dir — never inside
+The queue keeps its own file *beside* the host's data dir — never inside
 a project. The host data dir is `~/.config/openchamber`, unless `OPENCHAMBER_DATA_DIR`
 is set on the host (a service process does not receive that variable, so a custom
 host dir is not mirrored).
@@ -152,8 +156,8 @@ demand, so after the OpenChamber process restarts the queue is paused until you 
 the panel once (or run a message action / `/queue` command). After that it is
 resident again. A queue that was enabled resumes where it left off.
 
-Uninstalling the extension removes the host-owned foreground storage; delete
-`~/.config/openchamber-queue/` by hand to wipe the background queue too.
+Uninstalling the extension clears its install record and grants; delete
+`~/.config/openchamber-queue/` by hand to wipe the queue state too.
 
 ## Permissions
 
@@ -161,7 +165,10 @@ Uninstalling the extension removes the host-owned foreground storage; delete
 | --- | --- |
 | `sessions` | list projects and sessions, create sessions |
 | `prompt` | send the task content to the new session |
-| `service` | granted together with the local service; it runs with your full user rights |
+| `service` | the local service that owns the queue; it is required and runs with your full user rights |
+
+The queue has no panel-side fallback: if the local service is not approved, the
+panel stays on the connecting state until it is.
 
 ## Limitations
 

@@ -246,11 +246,31 @@ export const markFailed = (state: QueueState, projectId: string, taskId: string,
 };
 
 /** Activity of one session, as the host computes it. */
-export type SessionActivity = 'unknown' | 'idle' | 'running' | 'retrying' | 'waiting-permission' | 'waiting-question';
+export type SessionActivity =
+  | 'unknown'
+  | 'idle'
+  | 'running'
+  | 'retrying'
+  | 'waiting-permission'
+  | 'waiting-question'
+  /**
+   * The turn paused, but work it left behind still runs — a backgrounded shell
+   * command (or a subagent). OpenCode reports such a session as idle because the
+   * agent is free to answer, yet the task is not finished: the result will wake
+   * the session again. The queue must not treat that pause as the end.
+   */
+  | 'background';
 
-/** A session is occupied when it is really executing, which a question is not. */
+/**
+ * A session is occupied when it is really executing, which a question is not and
+ * a backgrounded task is (the session is idle only because it handed the work to
+ * the background; it is not done).
+ */
 export const isOccupied = (activity: SessionActivity): boolean =>
-  activity === 'running' || activity === 'retrying' || activity === 'waiting-permission';
+  activity === 'running' ||
+  activity === 'retrying' ||
+  activity === 'waiting-permission' ||
+  activity === 'background';
 
 /**
  * Status of the session this queue itself dispatched: `running` while it really
@@ -361,12 +381,4 @@ export type QueueSnapshot = {
   project: ProjectInfo | null;
   queue: ProjectQueue;
   seq: number;
-};
-
-/** Short string used for storage keys, where a raw project id can be too long. */
-export const hashKey = (value: string): string => {  let hash = 5381;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = ((hash << 5) + hash + value.charCodeAt(index)) >>> 0;
-  }
-  return hash.toString(16).padStart(8, '0');
 };

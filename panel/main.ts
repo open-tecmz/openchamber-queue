@@ -1,16 +1,16 @@
 /**
  * OpenChamber Queue — rail panel and background frame.
  *
- * Two data modes:
- *  - `backend`: the `contributes.service` grant exists and the service is
- *    reachable. The service owns the queue and keeps dispatching with no
- *    client open.
- *  - `local`: no service grant. The panel drives with host APIs while open.
+ * The queue lives in the extension's local service (`contributes.service`).
+ * The service owns the state and keeps dispatching with no client open; the
+ * panel is only a view onto that service. When the service is not up yet the
+ * panel shows a connecting state and retries until it answers, rather than
+ * keeping a second, panel-owned copy of the queue.
  *
- * In `backend` mode the panel does not poll: it follows the service's event
- * stream (`GET /events`), which answers the moment the queue moves and ends the
- * hold when it does not, and it re-reads from its cursor whenever a hold ends.
- * The service also exposes that stream as real SSE (`GET /events/stream`).
+ * The panel does not poll: it follows the service's event stream (`GET
+ * /events`), which answers the moment the queue moves and ends the hold when it
+ * does not, and it re-reads from its cursor whenever a hold ends. The service
+ * also exposes that stream as real SSE (`GET /events/stream`).
  *
  * Panel copy follows the OpenChamber language (`ctx.locale`); see `src/i18n.ts`.
  */
@@ -18,7 +18,6 @@
 import {
   HostRequestError,
   connectHost,
-  type GuestSessionsSnapshot,
   type HostClient,
 } from '@openchamber/sdk';
 import {
@@ -37,43 +36,18 @@ import {
 } from '@openchamber/sdk/ui';
 
 import {
-  ACTIVE_GRACE_MS,
-  DISPATCH_DELAY_MS,
-  clearTasks,
   countTasks,
   deriveTitle,
-  editTask,
   emptyQueue,
-  emptyState,
-  ensureQueue,
-  finishRun,
-  firstPending,
-  getQueue,
-  hashKey,
-  isOccupied,
-  makeTask,
-  markFailed,
-  moveTask,
-  planTick,
-  registerProject,
-  removeTask,
-  repairQueue,
-  retryTask,
-  startTask,
-  type ActiveRun,
-  type ActiveStatus,
   type ProjectInfo,
   type ProjectQueue,
   type QueueEvent,
   type QueueSnapshot,
-  type QueueState,
   type QueueTask,
-  type SessionActivity,
 } from '../src/core.ts';
 import { createTranslator, type Translator } from '../src/i18n.ts';
 
 const PROVIDER_ID = 'queue';
-const STORAGE_PREFIX = 'openchamber-queue';
 /**
  * How long a read of the service's event stream may hold before it answers "no
  * events yet". A parked read costs a whole connection, and a sandboxed panel
@@ -88,13 +62,10 @@ const STORAGE_PREFIX = 'openchamber-queue';
 const WAIT_MS = 2000;
 /** A watch that fails instantly (not by expiring) waits this long before retrying. */
 const WATCH_RETRY_MS = 1000;
-/** Used only for a service too old to have an event stream. */
+/** How often a panel that has no service yet re-checks for one. */
 const FALLBACK_POLL_MS = 5000;
-/** Foreground mode is driven by host session pushes; this is the safety net. */
-const LOCAL_SAFETY_MS = 30_000;
-const MAX_STEPS_PER_TICK = 4;
 
-type Mode = 'backend' | 'local' | 'unknown';
+type Mode = 'backend' | 'unknown';
 
 const host: HostClient = connectHost();
 const root = document.querySelector('#root') as HTMLElement;
@@ -239,240 +210,20 @@ const backend = {
 };
 
 // ---------------------------------------------------------------------------
-// Local storage (no service grant)
-// ---------------------------------------------------------------------------
-
-let localState: QueueState = emptyState();
-const indexKey = `${STORAGE_PREFIX}/index`;
-const queueKey = (projectId: string) => `${STORAGE_PREFIX}/q/${hashKey(projectId)}`;
-
-const loadLocal = async (): Promise<void> => {
-  localState = emptyState();
-  const index = (await host.storage.get(indexKey)) as { projects?: Record<string, ProjectInfo> } | undefined;
-  for (const [id, info] of Object.entries(index?.projects ?? {})) {
-    localState.projects[id] = info;
-    const stored = (await host.storage.get(queueKey(id))) as ProjectQueue | undefined;
-    localState.queues[id] = stored ? repairQueue(stored) : emptyQueue();
-  }
-};
-
-const saveIndex = (): Promise<void> => host.storage.set(indexKey, { projects: localState.projects } as never);
-const saveQueue = (projectId: string): Promise<void> =>
-  host.storage.set(queueKey(projectId), localState.queues[projectId] as never);
-
-// ---------------------------------------------------------------------------
-// Local driver: the same tick rule, driven by host session snapshots
-// ---------------------------------------------------------------------------
-
-const activeStatusFor = (active: ActiveRun, sessions: any[]): ActiveStatus => {
-  const session = sessions.find((entry) => entry.id === active.sessionId);
-  if (!session) {
-    // The snapshot may not include a just-created session yet.
-    return Date.now() - active.startedAt >= ACTIVE_GRACE_MS ? 'free' : 'running';
-  }
-  if (session.archivedAt) return 'free';
-  return isOccupied(session.activity as SessionActivity) ? 'running' : 'free';
-};
-
-const readSessions = async (projectId: string): Promise<GuestSessionsSnapshot | null> => {
-  try {
-    return await host.listSessions(projectId);
-  } catch {
-    return null;
-  }
-};
-
-/**
- * Hand one task to a session through the host API, on success or failure alike.
- *
- * The host session API takes a title and prefixes it with this task id, so a
- * foreground dispatch cannot leave OpenCode to auto-title the session (that
- * only happens while a session keeps its default title). The background service
- * dispatches through the control API and does leave the title out; this path is
- * only the fallback for when the service is not running.
- */
-const dispatchLocal = async (projectId: string, task: QueueTask): Promise<void> => {
-  try {
-    const result = await host.startSession({
-      providerId: PROVIDER_ID,
-      id: task.id,
-      title: deriveTitle(task.text, t('task.untitled')),
-      url: '',
-      text: task.text,
-      projectId,
-      navigation: 'preserve',
-    });
-    if (result.sessionId && result.sent === 'sent') {
-      startTask(localState, projectId, task.id, result.sessionId);
-    } else if (result.sessionId) {
-      markFailed(localState, projectId, task.id, result.sent === 'no-model' ? t('reason.noModel') : t('reason.sendFailed', { sent: result.sent }));
-    } else {
-      markFailed(localState, projectId, task.id, t('reason.createFailed'));
-    }
-  } catch (error) {
-    markFailed(localState, projectId, task.id, error instanceof Error ? error.message : String(error));
-  }
-};
-
-/**
- * A project's idle clock for the foreground driver: the moment it was last seen
- * free, or absent while it is occupied. It mirrors the service's clock so both
- * drivers wait out the same settle window before the next task.
- */
-const localFreeSince = new Map<string, number>();
-
-/** The dispatch checks armed per project in the foreground driver. */
-const localDispatchChecks = new Map<string, number>();
-
-const cancelLocalDispatchCheck = (projectId: string): void => {
-  const timer = localDispatchChecks.get(projectId);
-  if (timer !== undefined) window.clearTimeout(timer);
-  localDispatchChecks.delete(projectId);
-};
-
-const trackLocalIdle = (projectId: string, free: boolean, now: number): number => {
-  if (!free) {
-    localFreeSince.delete(projectId);
-    return 0;
-  }
-  const since = localFreeSince.get(projectId) ?? now;
-  localFreeSince.set(projectId, since);
-  return now - since;
-};
-
-/** Re-run the foreground driver for a project once its settle window is up. */
-const scheduleLocalDispatchCheck = (projectId: string): void => {
-  const since = localFreeSince.get(projectId);
-  if (since === undefined) return;
-  const delayMs = Math.max(0, since + DISPATCH_DELAY_MS - Date.now());
-  cancelLocalDispatchCheck(projectId);
-  const timer = window.setTimeout(() => {
-    localDispatchChecks.delete(projectId);
-    void localDrive(projectId);
-  }, delayMs);
-  localDispatchChecks.set(projectId, timer);
-};
-
-/**
- * One pass of the foreground driver for one project: evaluate the queue and, if
- * a session was created, save and re-render. Shared by the session listener, the
- * safety tick and the settle-window check.
- */
-const localDrive = async (projectId: string, pushed?: GuestSessionsSnapshot | null): Promise<void> => {
-  if (mode !== 'local' || project?.id !== projectId) return;
-  if (await localTick(projectId, pushed)) await saveQueue(projectId);
-  await refresh();
-};
-
-const localTick = async (projectId: string, pushed?: GuestSessionsSnapshot | null): Promise<boolean> => {
-  const info = localState.projects[projectId];
-  if (!info) return false;
-  let mutated = false;
-
-  for (let step = 0; step < MAX_STEPS_PER_TICK; step += 1) {
-    const current = getQueue(localState, projectId);
-    if (!current.active && (!current.enabled || current.tasks.length === 0)) {
-      // Nothing queued: the settle window only starts once there is work to run.
-      localFreeSince.delete(projectId);
-      cancelLocalDispatchCheck(projectId);
-      break;
-    }
-
-    // The first pass can reuse the snapshot the host just pushed; a later pass
-    // needs a fresh one to see a session we created a moment ago.
-    const snapshot = step === 0 && pushed ? pushed : await readSessions(projectId);
-    // An unready snapshot must never pass for "nothing is running".
-    if (snapshot?.state !== 'ready') break;
-    const sessions = (snapshot.sessions ?? []).filter((session) => session.archivedAt === null);
-
-    const observation = {
-      projectBusy: sessions.some((session) => isOccupied(session.activity as SessionActivity)),
-      activeStatus: current.active ? activeStatusFor(current.active, sessions) : ('free' as ActiveStatus),
-    };
-    const now = Date.now();
-    const free = current.active === null && !observation.projectBusy;
-    const decision = planTick(current, { ...observation, idleMs: trackLocalIdle(projectId, free, now) });
-
-    if (decision.kind === 'finish') {
-      finishRun(localState, projectId);
-      mutated = true;
-      continue;
-    }
-
-    if (decision.kind === 'dispatch') {
-      cancelLocalDispatchCheck(projectId);
-      const task = current.tasks.find((entry) => entry.id === decision.taskId);
-      if (!task) break;
-      await dispatchLocal(projectId, task);
-      mutated = true;
-      break;
-    }
-
-    // Waiting on the settle window (or occupied): re-check when it is up.
-    if (free && firstPending(current)) scheduleLocalDispatchCheck(projectId);
-    else cancelLocalDispatchCheck(projectId);
-    break;
-  }
-  return mutated;
-};
-
-// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
-
-const localCommand = (projectId: string, command: Record<string, unknown>): void => {
-  switch (command.op) {
-    case 'enqueue': {
-      const text = String(command.text ?? '').trim();
-      if (text) ensureQueue(localState, projectId).tasks.push(makeTask(text));
-      break;
-    }
-    case 'edit':
-      editTask(localState, projectId, String(command.taskId), String(command.text ?? ''));
-      break;
-    case 'remove':
-      removeTask(localState, projectId, String(command.taskId));
-      break;
-    case 'move':
-      moveTask(localState, projectId, String(command.taskId), command.direction as never);
-      break;
-    case 'retry':
-      retryTask(localState, projectId, String(command.taskId));
-      break;
-    case 'clear':
-      clearTasks(localState, projectId);
-      break;
-    case 'set-enabled':
-      ensureQueue(localState, projectId).enabled = command.enabled === true;
-      break;
-    default:
-      break;
-  }
-};
 
 const pushCommand = async (command: Record<string, unknown>): Promise<void> => {
   if (!project || mode === 'unknown') return;
   beginPending();
   try {
-    if (mode === 'backend') {
-      // A command answers as soon as it applied its change, before the dispatch
-      // it may have enabled: an event may already be ahead of that answer, so
-      // the cursor only ever moves forward.
-      const result = await backend.command(project.id, command);
-      if (result.queue && result.seq >= seq) {
-        queue = result.queue;
-        seq = result.seq;
-      }
-    } else if (command.op === 'run') {
-      // "Run" posts one task now: it is dispatched exactly like the scheduler
-      // would, just without waiting for the project to be free.
-      const task = getQueue(localState, project.id).tasks.find((entry) => entry.id === String(command.taskId));
-      if (task) await dispatchLocal(project.id, task);
-      await saveQueue(project.id);
-    } else {
-      localCommand(project.id, command);
-      await saveQueue(project.id);
-      if (await localTick(project.id)) await saveQueue(project.id);
+    // A command answers as soon as it applied its change, before the dispatch it
+    // may have enabled: an event may already be ahead of that answer, so the
+    // cursor only ever moves forward.
+    const result = await backend.command(project.id, command);
+    if (result.queue && result.seq >= seq) {
+      queue = result.queue;
+      seq = result.seq;
     }
     await publish();
   } finally {
@@ -482,34 +233,14 @@ const pushCommand = async (command: Record<string, unknown>): Promise<void> => {
 
 /**
  * "Run now": create a session with the draft text immediately instead of
- * queueing it. Backend mode asks the service to do it; foreground mode uses the
- * host session API directly.
+ * queueing it. The service owns dispatch, so the command is all this sends.
  */
 const runNow = async (text: string): Promise<boolean> => {
   const trimmed = text.trim();
   if (!trimmed || !project || mode === 'unknown') return false;
   beginPending();
   try {
-    if (mode === 'backend') {
-      await backend.command(project.id, { op: 'run-now', text: trimmed });
-    } else {
-      const result = await host.startSession({
-        providerId: PROVIDER_ID,
-        id: `run_${Date.now()}`,
-        title: deriveTitle(trimmed, t('task.untitled')),
-        url: '',
-        text: trimmed,
-        projectId: project.id,
-        navigation: 'preserve',
-      });
-      if (!result.sessionId || result.sent !== 'sent') {
-        await host.toast({
-          kind: 'error',
-          message: result.sent === 'no-model' ? t('reason.noModel') : t('reason.sendFailed', { sent: result.sent }),
-        });
-        return false;
-      }
-    }
+    await backend.command(project.id, { op: 'run-now', text: trimmed });
   } catch (error) {
     await host.toast({ kind: 'error', message: error instanceof Error ? error.message : String(error) });
     return false;
@@ -522,34 +253,30 @@ const runNow = async (text: string): Promise<boolean> => {
   return true;
 };
 
-const registerProjectEverywhere = async (info: ProjectInfo): Promise<void> => {
+const registerProject = async (info: ProjectInfo): Promise<void> => {
   if (mode === 'unknown') return;
-  if (mode === 'backend') {
-    // The service decides whether this is news: a project it already knows is
-    // answered without an event, a state write or a tick.
-    await backend.command(info.id, { op: 'register', directory: info.directory, name: info.name });
-    return;
-  }
-  if (!registerProject(localState, info)) return;
-  await saveIndex();
-  await saveQueue(info.id);
+  // The service decides whether this is news: a project it already knows is
+  // answered without an event, a state write or a tick.
+  await backend.command(info.id, { op: 'register', directory: info.directory, name: info.name });
 };
 
 // ---------------------------------------------------------------------------
-// Mode detection, change watching, local driver wiring
+// Mode detection, change watching
 // ---------------------------------------------------------------------------
 
+/**
+ * The service is the only queue there is. It starts on demand: the first request
+ * wakes it, so a failure here usually just means it is not up yet. Stay in
+ * `unknown` and let the slow retry ask again, rather than keeping a second,
+ * panel-owned queue that the service would not see once it is up — that is what
+ * made tasks added while the service was starting disappear on the next reload.
+ */
 const detectMode = async (): Promise<void> => {
   try {
     await backend.health();
     mode = 'backend';
-  } catch (error) {
-    if (isNoService(error)) {
-      mode = 'local';
-      await loadLocal();
-    } else {
-      mode = 'unknown';
-    }
+  } catch {
+    mode = 'unknown';
   }
 };
 
@@ -560,8 +287,6 @@ const delay = (ms: number): Promise<void> =>
 
 let watchToken = 0;
 let watchTimer: number | null = null;
-let localSafetyTimer: number | null = null;
-let sessionUnsubscribe: (() => void) | null = null;
 /** Cursor into the service's event log: the last sequence number applied. */
 let seq = 0;
 
@@ -577,18 +302,13 @@ const refresh = async (): Promise<void> => {
     return;
   }
   try {
-    if (mode === 'backend') {
-      const loaded = await backend.load(project.id);
-      queue = loaded.queue;
-      seq = loaded.seq;
-    } else {
-      queue = getQueue(localState, project.id);
-    }
+    const loaded = await backend.load(project.id);
+    queue = loaded.queue;
+    seq = loaded.seq;
   } catch (error) {
-    if (isNoService(error)) {
-      await applyMode();
-      queue = mode === 'local' ? getQueue(localState, project.id) : queue;
-    }
+    // The service may have gone away; switch to the connecting state and let
+    // the slow retry bring it back. Keep the last known queue on screen.
+    if (isNoService(error)) await applyMode();
   }
   await publish();
 };
@@ -624,16 +344,12 @@ const stopWatch = (): void => {
   }
 };
 
-const stopLocalDriver = (): void => {
-  sessionUnsubscribe?.();
-  sessionUnsubscribe = null;
-  if (localSafetyTimer !== null) {
-    window.clearInterval(localSafetyTimer);
-    localSafetyTimer = null;
+/** Stop the connecting retry (it and the watch share the timer slot). */
+const stopSlowRetry = (): void => {
+  if (watchTimer !== null) {
+    window.clearInterval(watchTimer);
+    watchTimer = null;
   }
-  for (const timer of localDispatchChecks.values()) window.clearTimeout(timer);
-  localDispatchChecks.clear();
-  localFreeSince.clear();
 };
 
 /**
@@ -690,6 +406,8 @@ const startSlowRetry = (): void => {
     void (async () => {
       if (!panelMounted || document.hidden) return;
       if (mode === 'unknown') await applyMode();
+      // The mode may have just become `backend`; the watch owns the timer now.
+      else stopSlowRetry();
       await refresh();
     })();
   }, FALLBACK_POLL_MS);
@@ -702,42 +420,31 @@ const startWatching = (): void => {
   void streamBackend(watchToken);
 };
 
-const startLocalDriver = async (): Promise<void> => {
-  stopLocalDriver();
-  if (!project || mode !== 'local') return;
-  const projectId = project.id;
-  try {
-    sessionUnsubscribe = await host.onSessions(projectId, (snapshot) => void localDrive(projectId, snapshot));
-  } catch {
-    sessionUnsubscribe = null;
-  }
-  // The host pushes session changes, but a missed one would stall the queue, so
-  // a slow tick is the safety net. This mode is the only driver there is, so it
-  // keeps running even while the window is hidden.
-  localSafetyTimer = window.setInterval(() => void localDrive(projectId), LOCAL_SAFETY_MS);
-};
-
-/** Point the watcher and the local driver at whichever mode is current. */
+/** Start the event watch for a reachable service, or retry while it starts. */
 const syncDrivers = async (): Promise<void> => {
-  if (mode === 'local') {
-    stopWatch();
-    await startLocalDriver();
+  if (mode === 'backend') {
+    stopSlowRetry();
+    startWatching();
     return;
   }
-  stopLocalDriver();
-  startWatching();
   // "Connecting" means the service may still be coming up: keep asking, slowly.
-  if (mode === 'unknown') startSlowRetry();
+  startSlowRetry();
 };
 
+/**
+ * The service owns the queue, so any project the panel shows must be registered
+ * with it once it is reachable. `detectMode` may have answered `unknown` on the
+ * first try (the service starts on demand), so registering on every upgrade to
+ * `backend` is what makes the project known after a cold start.
+ */
 const applyMode = async (): Promise<void> => {
   await detectMode();
+  if (mode === 'backend' && project) await registerProject(project);
   await syncDrivers();
 };
 
-// Nobody is reading while the window is hidden: the backend watch is stopped and
-// restarted on return. Foreground mode keeps its own driver running, because it
-// is the only thing dispatching there.
+// Nobody is reading while the window is hidden: the watch is stopped and
+// restarted on return.
 document.addEventListener('visibilitychange', () => {
   if (!panelMounted) return;
   if (document.hidden) {
@@ -746,7 +453,7 @@ document.addEventListener('visibilitychange', () => {
   }
   void (async () => {
     await refresh();
-    if (mode !== 'local') await syncDrivers();
+    await syncDrivers();
   })();
 });
 
@@ -879,7 +586,7 @@ const render = (): void => {
   titleRow.appendChild(el('span', 'qx-project', project?.name ?? project?.directory ?? t('noProject')));
   disposables.push(mountBadge(titleRow, {
     label: modeLabel(mode),
-    tone: mode === 'backend' ? 'info' : mode === 'local' ? 'warning' : 'neutral',
+    tone: mode === 'backend' ? 'info' : 'warning',
   }));
 
   if (project) {
@@ -888,14 +595,8 @@ const render = (): void => {
     disposables.push(mountBadge(countsRow, { label: t('count.completed', { n: counts.completed }), tone: 'success' }));
   }
 
-  if (mode === 'local') {
-    disposables.push(mountBanner(controls, {
-      tone: 'warning',
-      title: t('banner.local.title'),
-      body: t('banner.local.body'),
-    }));
-  } else if (mode === 'unknown') {
-    disposables.push(mountBanner(controls, { tone: 'error', title: t('banner.error.title'), body: t('banner.error.body') }));
+  if (mode === 'unknown') {
+    disposables.push(mountBanner(controls, { tone: 'warning', title: t('banner.error.title'), body: t('banner.error.body') }));
   }
 
   if (!project) {
@@ -1081,22 +782,13 @@ const resolveTarget = async (dir: string | null): Promise<Target | null> => {
   return { projectId: `dir:${dir}`, directory: dir, name: dir };
 };
 
+/** Queue a task from a message action or the `/queue` command; the service owns it. */
 const enqueueAnywhere = async (target: Target, text: string): Promise<void> => {
   const trimmed = text.trim();
   if (!trimmed) return;
-  try {
-    await backend.health();
-    await backend.command(target.projectId, { op: 'register', directory: target.directory, name: target.name });
-    await backend.command(target.projectId, { op: 'enqueue', text: trimmed });
-    return;
-  } catch (error) {
-    if (!isNoService(error)) throw error;
-  }
-  await loadLocal();
-  localState.projects[target.projectId] = { id: target.projectId, directory: target.directory, name: target.name };
-  ensureQueue(localState, target.projectId).tasks.push(makeTask(trimmed));
-  await saveIndex();
-  await saveQueue(target.projectId);
+  await backend.health();
+  await backend.command(target.projectId, { op: 'register', directory: target.directory, name: target.name });
+  await backend.command(target.projectId, { op: 'enqueue', text: trimmed });
 };
 
 const mountBackground = (): void => {
@@ -1110,7 +802,12 @@ const mountBackground = (): void => {
       return;
     }
     const text = item.kind === 'message' ? item.text : '';
-    await enqueueAnywhere(target, text);
+    try {
+      await enqueueAnywhere(target, text);
+    } catch {
+      await host.toast({ kind: 'error', message: t('toast.noService') });
+      return;
+    }
     await host.toast({ kind: 'success', message: t('toast.enqueued') });
   });
 
@@ -1120,7 +817,12 @@ const mountBackground = (): void => {
     if (!text) return null;
     const target = await resolveTarget(directoryRef);
     if (!target) return null;
-    await enqueueAnywhere(target, text);
+    try {
+      await enqueueAnywhere(target, text);
+    } catch {
+      await host.toast({ kind: 'error', message: t('toast.noService') });
+      return null;
+    }
     return { providerId: PROVIDER_ID, id: `queue-${Date.now()}`, title: deriveTitle(text, t('task.untitled')), url: '' };
   });
 };
@@ -1136,7 +838,7 @@ const preparePanel = async (): Promise<void> => {
       project = target ? { id: target.projectId, directory: target.directory, name: target.name } : null;
     }
     await detectMode();
-    if (project) await registerProjectEverywhere(project);
+    if (project) await registerProject(project);
     await syncDrivers();
   } finally {
     // Whatever the outcome, stop showing the loading state.
@@ -1179,11 +881,10 @@ host.onDirectory((next) => {
     draftText = '';
     const target = next ? await resolveTarget(next) : null;
     project = target ? { id: target.projectId, directory: target.directory, name: target.name } : null;
-    if (project) await registerProjectEverywhere(project);
-    // The backend stream belongs to the service and carries every project, so
-    // switching projects keeps the reader and the cursor: only the new project's
-    // state is read. Foreground mode drives one project, so it restarts.
-    if (mode === 'local') stopWatch();
+    if (project) await registerProject(project);
+    // The stream belongs to the service and carries every project, so switching
+    // projects keeps the reader and the cursor: only the new project's state is
+    // read.
     await refresh();
     await syncDrivers();
   })();
