@@ -90,6 +90,11 @@ let composerProject: string | null = null;
 let draftDirty = false;
 /** The composer field has focus: hold queue-driven re-renders so typing is never disturbed. */
 let composerFocused = false;
+/**
+ * A frozen composer can hide a queue change. Setting this asks for one repaint
+ * after the next click has finished bubbling — see the listener below.
+ */
+let catchUpAfterBlur = false;
 /** True until the panel has read the queue for the first time. */
 let loading = true;
 
@@ -280,6 +285,7 @@ const resetDraft = (): void => {
   composerProject = null;
   draftDirty = false;
   composerFocused = false;
+  catchUpAfterBlur = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -553,6 +559,15 @@ window.addEventListener('pagehide', () => {
   if (panelMounted) flushDraftSave();
 });
 
+// A click that blurred the frozen composer is done by the time it bubbles here,
+// so its button or row has already handled it. Only now is it safe to repaint
+// and show whatever the queue became while the box held focus.
+document.addEventListener('click', () => {
+  if (!catchUpAfterBlur) return;
+  catchUpAfterBlur = false;
+  if (!composerFocused) render();
+});
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -673,6 +688,8 @@ const render = (): void => {
   const key = computeRenderKey();
   if (key === renderKey) return;
   renderKey = key;
+  // A full repaint is the catch-up the blur asked for, whenever it happens.
+  catchUpAfterBlur = false;
 
   // Keep the caret with its field across the rebuild: the composer remains
   // editable while the panel repaints around it (for example when a task is
@@ -759,11 +776,11 @@ const render = (): void => {
       },
       onBlur: () => {
         composerFocused = false;
-        // Deferred so a click on Add/Run — which blurs the box first — still
-        // reaches its button before the repaint replaces it.
-        window.setTimeout(() => {
-          if (!composerFocused) render();
-        }, 0);
+        // Repainting here would replace the button or row the user is clicking,
+        // before its `click` handler runs — the click would then do nothing.
+        // Mark a catch-up instead; the document listener below repaints once the
+        // click has finished bubbling.
+        catchUpAfterBlur = true;
       },
     },
   );
