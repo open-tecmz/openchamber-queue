@@ -53,6 +53,10 @@ work to do.
   refused while the queue is running.
 - **Works with the page closed** — the queue is driven by a server-side local
   service, not by the browser tab.
+- **Keystrokes aren't lost** — the composer is kept per project as a draft and
+  written to the local service, so a reload, an OpenChamber restart or a hard
+  exit restores what you were typing; a background queue change never wipes a
+  half-typed task.
 - **Localized panel** — follows the OpenChamber language (English, 简体中文, 繁體中文).
 
 ## How it works
@@ -151,10 +155,12 @@ is set on the host (a service process does not receive that variable, so a custo
 host dir is not mirrored).
 
 Data is a plain JSON file, so it survives restarts, updates and uninstalling. The
-**worker, however, does not auto-start**: OpenChamber spawns a guest service only on
-demand, so after the OpenChamber process restarts the queue is paused until you open
-the panel once (or run a message action / `/queue` command). After that it is
-resident again. A queue that was enabled resumes where it left off.
+composer draft for each project lives in this same file, so a half-typed task is
+restored after a reload or a restart. The **worker, however, does not auto-start**:
+OpenChamber spawns a guest service only on demand, so after the OpenChamber process
+restarts the queue is paused until you open the panel once (or run a message action /
+`/queue` command). After that it is resident again. A queue that was enabled resumes
+where it left off.
 
 Uninstalling the extension clears its install record and grants; delete
 `~/.config/openchamber-queue/` by hand to wipe the queue state too.

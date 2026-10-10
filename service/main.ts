@@ -28,6 +28,7 @@ import {
   enqueue,
   finishRun,
   firstPending,
+  getDraft,
   getQueue,
   isOccupied,
   markFailed,
@@ -37,6 +38,7 @@ import {
   removeTask,
   repairQueue,
   retryTask,
+  setDraft,
   setEnabled,
   startTask,
   type ActiveRun,
@@ -107,6 +109,7 @@ const readState = async (): Promise<QueueState> => {
     if (!parsed || typeof parsed !== 'object') return emptyState();
     parsed.projects ??= {};
     parsed.queues ??= {};
+    parsed.drafts ??= {};
     for (const queue of Object.values(parsed.queues)) {
       if (queue && typeof queue === 'object') repairQueue(queue);
     }
@@ -698,7 +701,7 @@ const evaluateProject = (projectId: string): void => {
 // ---------------------------------------------------------------------------
 
 type Command = {
-  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'run-now' | 'tick';
+  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'run-now' | 'set-draft' | 'tick';
   projectId?: string;
   directory?: string;
   name?: string;
@@ -746,6 +749,8 @@ const applyCommand = async (command: Command): Promise<boolean> => {
       return clearTasks(state, projectId);
     case 'set-enabled':
       return setEnabled(state, projectId, command.enabled === true);
+    case 'set-draft':
+      return setDraft(state, projectId, command.text ?? '');
     case 'run-now':
       await runNow(projectId, command.text ?? '');
       return false;
@@ -797,6 +802,7 @@ const server = http.createServer((req, res) => {
       const snapshot: QueueSnapshot = {
         project: state.projects[projectId] ?? null,
         queue,
+        draft: getDraft(state, projectId),
         seq,
       };
       json(res, 200, { backend: true, projectId, ...snapshot, counts: summarize(queue) });
@@ -926,13 +932,19 @@ const server = http.createServer((req, res) => {
       const changed = await applyCommand(command);
       if (command.op !== 'tick' && changed) {
         await persist();
-        const type = command.projectId ? COMMAND_EVENTS[command.op] : undefined;
-        if (type && command.projectId) emit(command.projectId, type);
-        // A mutation may make a project dispatchable: evaluate it right away so
-        // the panel does not wait a whole tick — but do it behind this response
-        // (the event stream carries the result), so a click never waits on the
-        // session a dispatch has to create.
-        if (command.projectId) evaluateProject(command.projectId);
+        // A draft is only bookkeeping for the panel that typed it: persist it,
+        // but do not emit an event or re-evaluate the project. An echo would
+        // race the caret back into the box mid-keystroke, and a draft cannot
+        // make a queue dispatchable.
+        if (command.op !== 'set-draft') {
+          const type = command.projectId ? COMMAND_EVENTS[command.op] : undefined;
+          if (type && command.projectId) emit(command.projectId, type);
+          // A mutation may make a project dispatchable: evaluate it right away so
+          // the panel does not wait a whole tick — but do it behind this response
+          // (the event stream carries the result), so a click never waits on the
+          // session a dispatch has to create.
+          if (command.projectId) evaluateProject(command.projectId);
+        }
       }
       const projectId = command.projectId ?? '';
       const queue = command.projectId ? getQueue(state, projectId) : null;

@@ -47,6 +47,12 @@ export type QueueState = {
   version: 1;
   projects: Record<string, ProjectInfo>;
   queues: Record<string, ProjectQueue>;
+  /**
+   * The composer text typed for a project but not yet queued, kept beside its
+   * queue so it survives a panel reload, an OpenChamber restart or a hard exit.
+   * Natural key is the project id; an empty entry means "no draft".
+   */
+  drafts: Record<string, string>;
 };
 
 export const STATE_VERSION = 1;
@@ -69,6 +75,7 @@ export const emptyState = (): QueueState => ({
   version: STATE_VERSION,
   projects: {},
   queues: {},
+  drafts: {},
 });
 
 export const emptyQueue = (): ProjectQueue => ({
@@ -104,6 +111,23 @@ export const ensureQueue = (state: QueueState, projectId: string): ProjectQueue 
 
 export const getQueue = (state: QueueState, projectId: string): ProjectQueue =>
   state.queues[projectId] ?? emptyQueue();
+
+/** The composer draft saved for a project, or an empty string. */
+export const getDraft = (state: QueueState, projectId: string): string =>
+  projectId ? state.drafts[projectId] ?? '' : '';
+
+/**
+ * Save a project's composer draft. Returns false when it did not change, so a
+ * caller can skip a state write — a panel that re-sends the same text costs
+ * nothing. An empty value is kept as an entry: it is how "the box was cleared"
+ * is told apart from "no draft was ever saved".
+ */
+export const setDraft = (state: QueueState, projectId: string, text: string): boolean => {
+  if (!projectId) return false;
+  if ((state.drafts[projectId] ?? '') === text) return false;
+  state.drafts[projectId] = text;
+  return true;
+};
 
 export const makeTask = (text: string, now = Date.now()): QueueTask => ({
   id: nextId(),
@@ -380,5 +404,7 @@ export type QueueEvent = {
 export type QueueSnapshot = {
   project: ProjectInfo | null;
   queue: ProjectQueue;
+  /** The composer draft saved for this project. */
+  draft: string;
   seq: number;
 };

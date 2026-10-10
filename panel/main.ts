@@ -82,6 +82,14 @@ let backgroundMounted = false;
 let directoryRef: string | null = null;
 let editingId: string | null = null;
 let draftText = '';
+/** The composer text for the open project, kept across renders and mirrored to the service. */
+let composerDraft = '';
+/** The project `composerDraft` belongs to, so a refresh only adopts the service draft. */
+let composerProject: string | null = null;
+/** True when `composerDraft` has changed since it was last saved. */
+let draftDirty = false;
+/** The composer field has focus: hold queue-driven re-renders so typing is never disturbed. */
+let composerFocused = false;
 /** True until the panel has read the queue for the first time. */
 let loading = true;
 
@@ -177,7 +185,12 @@ const backend = {
   async load(projectId: string): Promise<QueueSnapshot> {
     const data = await this.request<Partial<QueueSnapshot>>('GET', '/state', { projectId });
     if (!data.queue) throw new EventsUnsupportedError('service did not return a queue');
-    return { project: data.project ?? null, queue: data.queue, seq: typeof data.seq === 'number' ? data.seq : 0 };
+    return {
+      project: data.project ?? null,
+      queue: data.queue,
+      draft: typeof data.draft === 'string' ? data.draft : '',
+      seq: typeof data.seq === 'number' ? data.seq : 0,
+    };
   },
   /**
    * Reads the service's event stream after `after`; holds until the first event
@@ -207,6 +220,66 @@ const backend = {
     );
     return { queue: data.queue ?? null, seq: typeof data.seq === 'number' ? data.seq : 0 };
   },
+};
+
+// ---------------------------------------------------------------------------
+// Draft persistence
+// ---------------------------------------------------------------------------
+
+/**
+ * How long typing must pause before the draft is written. Kept short so a hard
+ * exit loses at most a moment of typing; a flush also runs when the window is
+ * hidden, so the common "switch away then quit" never waits on it at all.
+ */
+const DRAFT_SAVE_MS = 400;
+
+let draftSaveTimer: number | null = null;
+
+/**
+ * Write the draft for `projectId` to the service, which owns it on disk. Best
+ * effort: a failure is retried by the next keystroke, and nothing depends on it.
+ */
+const persistDraft = async (projectId: string, text: string): Promise<void> => {
+  if (mode !== 'backend') return;
+  try {
+    await backend.command(projectId, { op: 'set-draft', text });
+    if (composerProject === projectId && composerDraft === text) draftDirty = false;
+  } catch {
+    // Leave `draftDirty` set so a later keystroke or flush tries again.
+  }
+};
+
+/** Arm (or re-arm) the debounced write of the current draft. */
+const scheduleDraftSave = (): void => {
+  if (!project || mode !== 'backend' || !draftDirty) return;
+  if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
+  const projectId = project.id;
+  const text = composerDraft;
+  draftSaveTimer = window.setTimeout(() => {
+    draftSaveTimer = null;
+    void persistDraft(projectId, text);
+  }, DRAFT_SAVE_MS);
+};
+
+/** Write the current draft now — at a switch, hide or exit — instead of waiting. */
+const flushDraftSave = (): void => {
+  if (draftSaveTimer !== null) {
+    window.clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  if (composerProject && draftDirty) void persistDraft(composerProject, composerDraft);
+};
+
+/** Forget the current draft (a project switch, or the panel going away). */
+const resetDraft = (): void => {
+  if (draftSaveTimer !== null) {
+    window.clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  composerDraft = '';
+  composerProject = null;
+  draftDirty = false;
+  composerFocused = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -305,6 +378,18 @@ const refresh = async (): Promise<void> => {
     const loaded = await backend.load(project.id);
     queue = loaded.queue;
     seq = loaded.seq;
+    if (composerProject === project.id) {
+      // This project's draft is already loaded. Keep what the user has typed
+      // even if it is still unsaved (the service may only just have come up),
+      // and push it so the two agree.
+      if (draftDirty) scheduleDraftSave();
+    } else {
+      // First read for this project: take the draft the service has on disk,
+      // which is what survives a reload, an OpenChamber restart or a hard exit.
+      composerDraft = loaded.draft;
+      composerProject = project.id;
+      draftDirty = false;
+    }
   } catch (error) {
     // The service may have gone away; switch to the connecting state and let
     // the slow retry bring it back. Keep the last known queue on screen.
@@ -444,17 +529,28 @@ const applyMode = async (): Promise<void> => {
 };
 
 // Nobody is reading while the window is hidden: the watch is stopped and
-// restarted on return.
+// restarted on return. The draft is written before the window goes away, so a
+// quit or a crash right after switching away still keeps what was typed.
 document.addEventListener('visibilitychange', () => {
   if (!panelMounted) return;
   if (document.hidden) {
     stopWatch();
+    // The user is no longer typing: release the render hold so the panel catches
+    // up on return, and write the draft before the window goes away.
+    composerFocused = false;
+    flushDraftSave();
     return;
   }
   void (async () => {
     await refresh();
     await syncDrivers();
   })();
+});
+
+// The last chance on a real exit. The request may not outlive the page, but the
+// debounce and the visibility flush have almost always saved it by now.
+window.addEventListener('pagehide', () => {
+  if (panelMounted) flushDraftSave();
 });
 
 // ---------------------------------------------------------------------------
@@ -481,10 +577,18 @@ const FIELD_PADDING_Y = 16;
 /** Fallback for a field that declares no rows. */
 const FIELD_DEFAULT_ROWS = 3;
 
-const mountGrowingField = (root: Element, initial: TextFieldProps): TextFieldHandle => {
+const mountGrowingField = (
+  root: Element,
+  initial: TextFieldProps,
+  options: { field?: string; onFocus?: () => void; onBlur?: () => void } = {},
+): TextFieldHandle => {
   const field = mountTextField(root, initial);
   const input = root.lastElementChild?.querySelector('textarea.oc-sdk-input') ?? null;
   if (!(input instanceof HTMLTextAreaElement)) return field;
+
+  if (options.field) input.dataset.qxField = options.field;
+  if (options.onFocus) input.addEventListener('focus', options.onFocus);
+  if (options.onBlur) input.addEventListener('blur', options.onBlur);
 
   // A floor for `height: auto` before the element has been laid out, and the
   // size an empty field keeps: the panel can mount while the rail is still
@@ -549,20 +653,35 @@ const endEdit = (): void => {
   render();
 };
 
-const render = (): void => {
-  if (!panelMounted) return;
-  // While a card is open for editing, ignore queue updates so the textarea
-  // keeps focus and the caret.
-  const key = JSON.stringify({
+/**
+ * The state a render depends on. A field that must not be disturbed while it is
+ * being used — the open editor, or the composer while it has focus — maps to a
+ * fixed token so a background change of that state does not force a rebuild.
+ */
+const computeRenderKey = (): string =>
+  JSON.stringify({
     localeTag,
     mode,
     loading,
     project: project?.id ?? null,
     editingId,
-    queue: editingId !== null ? 'editing' : queue,
+    queue: editingId !== null ? 'editing' : composerFocused ? 'composing' : queue,
   });
+
+const render = (): void => {
+  if (!panelMounted) return;
+  const key = computeRenderKey();
   if (key === renderKey) return;
   renderKey = key;
+
+  // Keep the caret with its field across the rebuild: the composer remains
+  // editable while the panel repaints around it (for example when a task is
+  // added elsewhere), and losing focus mid-sentence would be disruptive.
+  const active = document.activeElement;
+  const restoreFocus =
+    active instanceof HTMLTextAreaElement && active.dataset.qxField
+      ? { field: active.dataset.qxField, start: active.selectionStart, end: active.selectionEnd }
+      : null;
 
   clearDisposables();
   root.textContent = '';
@@ -613,31 +732,69 @@ const render = (): void => {
   }));
 
   const composer = controls.appendChild(el('div', 'qx-composer'));
-  let draft = '';
-  const field = mountGrowingField(composer, {
-    label: t('composer.label'),
-    value: draft,
-    placeholder: t('composer.placeholder'),
-    multiline: true,
-    rows: 3,
-    onChange: (value) => {
-      draft = value;
-      field.update({ value });
+  const field = mountGrowingField(
+    composer,
+    {
+      label: t('composer.label'),
+      value: composerDraft,
+      placeholder: t('composer.placeholder'),
+      multiline: true,
+      rows: 3,
+      onChange: (value) => {
+        composerDraft = value;
+        composerProject = project?.id ?? null;
+        draftDirty = true;
+        field.update({ value });
+        scheduleDraftSave();
+      },
     },
-  });
+    {
+      field: 'composer',
+      onFocus: () => {
+        composerFocused = true;
+        // Seal the render key so the next background queue event is a no-op for
+        // this field: rebuilding it would drop the caret and break an
+        // in-progress IME composition.
+        renderKey = computeRenderKey();
+      },
+      onBlur: () => {
+        composerFocused = false;
+        // Deferred so a click on Add/Run — which blurs the box first — still
+        // reaches its button before the repaint replaces it.
+        window.setTimeout(() => {
+          if (!composerFocused) render();
+        }, 0);
+      },
+    },
+  );
   disposables.push(field);
   const composerActions = composer.appendChild(el('div', 'qx-composer-actions'));
+  // Empty the box and persist the empty draft before a command repaints the
+  // panel, so the repaint never resurrects the text it just consumed.
+  const clearComposer = (): void => {
+    composerDraft = '';
+    composerProject = project?.id ?? null;
+    draftDirty = true;
+    field.update({ value: '' });
+    flushDraftSave();
+  };
+  const restoreComposer = (text: string): void => {
+    composerDraft = text;
+    composerProject = project?.id ?? null;
+    draftDirty = true;
+    field.update({ value: text });
+    scheduleDraftSave();
+  };
   const runButton = mountButton(composerActions, {
     label: t('composer.runNow'),
     variant: 'outline',
     size: 'sm',
     onClick: () =>
       withLoading(runButton, async () => {
-        if (!draft.trim()) return;
-        if (await runNow(draft)) {
-          draft = '';
-          field.update({ value: '' });
-        }
+        const text = composerDraft.trim();
+        if (!text) return;
+        clearComposer();
+        if (!(await runNow(text))) restoreComposer(text);
       }),
   });
   disposables.push(runButton);
@@ -646,10 +803,15 @@ const render = (): void => {
     size: 'sm',
     onClick: () =>
       withLoading(addButton, async () => {
-        if (!draft.trim()) return;
-        await pushCommand({ op: 'enqueue', text: draft });
-        draft = '';
-        field.update({ value: '' });
+        const text = composerDraft.trim();
+        if (!text) return;
+        clearComposer();
+        try {
+          await pushCommand({ op: 'enqueue', text });
+        } catch (error) {
+          restoreComposer(text);
+          throw error;
+        }
       }),
   });
   disposables.push(addButton);
@@ -664,6 +826,18 @@ const render = (): void => {
     }));
   } else {
     queue.tasks.forEach((task, index) => listHost.appendChild(renderTask(task, index + 1)));
+  }
+
+  if (restoreFocus) {
+    const input = root.querySelector<HTMLTextAreaElement>(`textarea[data-qx-field="${restoreFocus.field}"]`);
+    if (input) {
+      input.focus();
+      try {
+        input.setSelectionRange(restoreFocus.start, restoreFocus.end);
+      } catch {
+        // The field refused the range; the default caret is good enough.
+      }
+    }
   }
 };
 
@@ -739,7 +913,7 @@ const renderEditor = (task: QueueTask): HTMLElement => {
       draftText = value;
       field.update({ value });
     },
-  });
+  }, { field: 'editor' });
   disposables.push(field);
 
   const actions = card.appendChild(el('div', 'qx-edit-actions'));
@@ -875,6 +1049,10 @@ host.onDirectory((next) => {
   // must not run there.
   if (!panelMounted) return;
   if (next === directory) return;
+  // Switching projects: write the draft for the project being left first, then
+  // forget it so the new project's own draft can be read.
+  flushDraftSave();
+  resetDraft();
   directory = next;
   void (async () => {
     editingId = null;
