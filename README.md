@@ -147,12 +147,18 @@ Other ways to add a task:
 | Data | Location |
 | --- | --- |
 | Queue state | `~/.config/openchamber-queue/state.json`, or `$OPENCHAMBER_QUEUE_DATA_DIR/state.json` |
+| Diagnostic logs | `~/.config/openchamber-queue/logs/service.log`, or `$OPENCHAMBER_QUEUE_LOG_DIR/service.log` |
 | Install record and grants | `<OpenChamber data dir>/extensions.json` |
 
 The queue keeps its own file *beside* the host's data dir — never inside
 a project. The host data dir is `~/.config/openchamber`, unless `OPENCHAMBER_DATA_DIR`
 is set on the host (a service process does not receive that variable, so a custom
 host dir is not mirrored).
+
+The service writes what it does to `logs/service.log`, which is the first place to
+look when a dispatch or a session did not behave as expected. The active file rolls
+over once it reaches 10 MB, keeping five timestamped backups beside it, so the
+directory never grows without bound.
 
 Data is a plain JSON file, so it survives restarts, updates and uninstalling. The
 composer draft for each project lives in this same file, so a half-typed task is

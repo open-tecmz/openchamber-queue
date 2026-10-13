@@ -118,11 +118,15 @@
 | 数据 | 位置 |
 | --- | --- |
 | 队列数据 | `~/.config/openchamber-queue/state.json`，或 `$OPENCHAMBER_QUEUE_DATA_DIR/state.json` |
+| 运行日志 | `~/.config/openchamber-queue/logs/service.log`，或 `$OPENCHAMBER_QUEUE_LOG_DIR/service.log` |
 | 安装记录与权限 | `<OpenChamber 数据目录>/extensions.json` |
 
 队列把状态文件单独放在宿主数据目录**旁边**，绝不放进任何项目目录里。宿主数据目录为
 `~/.config/openchamber`，除非宿主侧设置了 `OPENCHAMBER_DATA_DIR`（该变量不会传给 service
 进程，因此自定义的宿主数据目录不会被镜像过来）。
+
+后台服务把运行过程写入 `logs/service.log`，这是排查派发或会话异常时最先要看的文件。
+当前文件写到 10 MB 就滚动一次，旁边保留 5 份带时间戳的备份，日志目录不会无限增长。
 
 数据是普通 JSON 文件，**重启、升级、卸载都不会丢**。每个项目的输入框草稿也保存在同一个
 文件里，刷新或重启后会自动恢复。但**后台 worker 不会自动启动**：

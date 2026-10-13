@@ -49,6 +49,7 @@ import {
   type QueueTask,
   type TickObservation,
 } from '../src/core.ts';
+import { createLogger } from './log.ts';
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
@@ -99,6 +100,16 @@ const STATE_DIR = process.env.OPENCHAMBER_QUEUE_DATA_DIR
   || path.join(os.homedir(), '.config', 'openchamber-queue');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 
+/**
+ * Diagnostic logs, kept beside the state: one active file that rolls over at
+ * 10 MB plus timestamped backups. This is where to look after the fact — the
+ * host's own capture of the child's output is short-lived and hard to find.
+ * `OPENCHAMBER_QUEUE_LOG_DIR` moves it for a caller that wants somewhere else.
+ */
+const LOG_DIR = process.env.OPENCHAMBER_QUEUE_LOG_DIR
+  || path.join(STATE_DIR, 'logs');
+const logger = createLogger(LOG_DIR);
+
 let state: QueueState = emptyState();
 let writeChain: Promise<void> = Promise.resolve();
 
@@ -128,7 +139,7 @@ const persist = (): Promise<void> => {
       await fsp.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8');
       await fsp.rename(tmp, STATE_FILE);
     } catch (error) {
-      console.error('[queue] failed to persist state', error);
+      logger.error('[queue] failed to persist state', error);
     }
   });
   return writeChain;
@@ -307,6 +318,7 @@ const ensureTarget = async (): Promise<Target | null> => {
     const password = await readInstancePassword(port);
     const cookie = password ? await login(base, password) : null;
     target = { base, cookie, bearer };
+    logger.info('[queue] connected to OpenChamber', { base, authenticated: cookie !== null || bearer !== null });
     return target;
   }
   return null;
@@ -499,9 +511,12 @@ const dispatch = async (projectId: string, directory: string, task: QueueTask): 
   const result = await control('session.create', { directory, prompt: task.text });
   if (result.ok && typeof result.body?.sessionId === 'string') {
     startTask(state, projectId, task.id, result.body.sessionId);
+    logger.info('[queue] dispatched task', { projectId, taskId: task.id, sessionId: result.body.sessionId });
     return 'run.started';
   }
-  markFailed(state, projectId, task.id, result.ok ? 'session.create returned no session id' : result.error);
+  const reason = result.ok ? 'session.create returned no session id' : result.error;
+  markFailed(state, projectId, task.id, reason);
+  logger.error('[queue] dispatch failed', { projectId, taskId: task.id, reason });
   return 'task.failed';
 };
 
@@ -529,7 +544,7 @@ const runNow = async (projectId: string, text: string): Promise<void> => {
     directory: info.directory,
     prompt: trimmed,
   });
-  if (!result.ok) console.error('[queue] run-now failed', result.error);
+  if (!result.ok) logger.error('[queue] run-now failed', result.error);
 };
 
 /**
@@ -602,6 +617,7 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
     // Nothing queued: the settle window only starts once there is work to run.
     freeSince.delete(projectId);
     cancelDispatchCheck(projectId);
+    offlineProjects.delete(projectId);
     return types;
   }
 
@@ -610,7 +626,19 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
     if (!queueHasWork(queue)) break;
 
     const sessions = await listSessions(info.directory);
-    if (!sessions) break;
+    if (!sessions) {
+      // The host refused the read (unreachable, unauthorized, or its own error).
+      // One line per outage, not one per tick, so a host that is down for a while
+      // does not bury everything else in the log.
+      if (!offlineProjects.has(projectId)) {
+        offlineProjects.add(projectId);
+        logger.warn('[queue] cannot read sessions', { projectId, directory: info.directory });
+      }
+      break;
+    }
+    if (offlineProjects.delete(projectId)) {
+      logger.info('[queue] sessions reachable again', { projectId });
+    }
     const observation = await observe(info.directory, sessions, queue.active);
     const now = Date.now();
     const free = queue.active === null && !observation.projectBusy;
@@ -645,6 +673,12 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
  */
 const tickingProjects = new Set<string>();
 
+/**
+ * Projects whose last session read failed, so an unreachable host is reported
+ * once instead of on every tick while it stays down.
+ */
+const offlineProjects = new Set<string>();
+
 const tickProject = async (projectId: string): Promise<boolean> => {
   if (tickingProjects.has(projectId)) return false;
   tickingProjects.add(projectId);
@@ -674,7 +708,7 @@ const tick = async (): Promise<void> => {
     }
   } catch (error) {
     // One project must not stop the sweep or raise an unhandled rejection.
-    console.error('[queue] tick failed', error);
+    logger.error('[queue] tick failed', error);
   }
   if (mutated) await persist();
 };
@@ -691,7 +725,7 @@ const evaluateProject = (projectId: string): void => {
     try {
       if (await tickProject(projectId)) await persist();
     } catch (error) {
-      console.error('[queue] tick failed', error);
+      logger.error('[queue] tick failed', error);
     }
   })();
 };
@@ -959,12 +993,20 @@ const server = http.createServer((req, res) => {
 
     json(res, 404, { error: 'not-found' });
   })().catch((error) => {
-    console.error('[queue] request failed', error);
+    logger.error('[queue] request failed', error);
     json(res, 500, { error: error instanceof Error ? error.message : 'failed' });
   });
 });
 
-server.listen(PORT, '127.0.0.1');
+server.on('error', (error) => logger.error('[queue] server error', error));
+server.listen(PORT, '127.0.0.1', () => {
+  logger.info('[queue] service listening', {
+    pid: process.pid,
+    port: PORT,
+    stateFile: STATE_FILE,
+    logFile: logger.file,
+  });
+});
 
 void (async () => {
   state = await readState();
@@ -973,5 +1015,21 @@ void (async () => {
   void tick();
 })();
 
-process.on('SIGTERM', () => server.close(() => process.exit(0)));
-process.on('SIGINT', () => server.close(() => process.exit(0)));
+// Anything the service did not catch still reaches the log, so a crash leaves a
+// trace behind instead of only on a stream the host may have already dropped.
+process.on('unhandledRejection', (reason) => {
+  logger.error('[queue] unhandled rejection', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('[queue] uncaught exception', error);
+  void logger.flush().finally(() => process.exit(1));
+});
+
+const shutdown = (signal: NodeJS.Signals): void => {
+  logger.info(`[queue] received ${signal}, shutting down`);
+  server.close(() => { void logger.flush().finally(() => process.exit(0)); });
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
