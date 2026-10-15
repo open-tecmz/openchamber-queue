@@ -46,6 +46,9 @@ until there is work to do.
   project has been idle for 30 seconds; no clicks per task.
 - **Run now** — a second button sends the draft into a fresh session at once,
   without queueing it.
+- **Append to the current session** — a third button queues the draft against the
+  session open in the panel, recording its id, and the queue sends the prompt to
+  that session when the project is idle instead of creating a new one.
 - **Run a queued task now** — each row has a *Run* button that starts that
   task's session immediately and removes it from the queue, counting it in *Done*.
 - **Hand-off queue** — a task is removed and counted in *Done* the moment its
@@ -93,6 +96,9 @@ the prompt, which is also what applies the project's default model. A task
 is created first, the project's default model and agent are switched onto it, and
 the prompt then goes out on the session's own route with one file part per image,
 carrying the bytes as a data URL — the same path the app's own composer uses.
+An **append** task skips session creation altogether: the prompt (with the same
+route when it carries images) goes to the session id it recorded, which keeps its
+own model, agent and history.
 
 "Really executing" means `running`, `retrying` or `waiting-permission`.
 `waiting-question` is **not** considered occupied, so an agent that is asking a
@@ -139,8 +145,9 @@ OpenChamber **2.0.0 or newer**, web or desktop.
 
 Open the **Queue** panel from the extensions area of the rail:
 
-1. Type a task in the box → **Run now** to start a session immediately, or
-   **Add to queue** to line it up.
+1. Type a task in the box → **Run now** to start a session immediately,
+   **Add to queue** to line it up, or **Append to session** to queue it for the
+   session that is open right now.
 2. Optionally attach up to four images: paste a screenshot into the box, drop
    files on the panel, or press **Add image**. They travel with the task and are
    sent as images on the session's first prompt. A task needs text; the images

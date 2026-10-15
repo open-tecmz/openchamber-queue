@@ -52,6 +52,7 @@ import {
   type QueueTask,
   type SessionActivity,
   type TaskImage,
+  type TaskTarget,
   type TickObservation,
 } from '../src/core.ts';
 import { createLogger } from './log.ts';
@@ -807,8 +808,29 @@ const startSessionFor = async (
   return { sessionId };
 };
 
+/**
+ * Append one prompt to a session that already exists: the target an "append"
+ * task recorded when it was queued. Nothing is created and no model is switched
+ * — the session keeps its own model, agent and history, and the task is simply
+ * its next message, sent when the queue dispatches it.
+ */
+const appendToSession = async (
+  directory: string,
+  sessionId: string,
+  prompt: Prompt,
+): Promise<{ sessionId: string } | { error: string }> => {
+  const sent = await sendPrompt(sessionId, directory, prompt);
+  if (!sent.ok) return { error: sent.error };
+  return { sessionId };
+};
+
 const dispatch = async (projectId: string, directory: string, task: QueueTask): Promise<QueueEventType> => {
-  const started = await startSessionFor(projectId, directory, { text: task.text, images: task.images });
+  // An append task names the session it belongs to; everything else creates a
+  // fresh session. Either way the dispatched session is remembered as the run.
+  const prompt: Prompt = { text: task.text, images: task.images };
+  const started = task.target
+    ? await appendToSession(directory, task.target.sessionId, prompt)
+    : await startSessionFor(projectId, directory, prompt);
   if ('sessionId' in started) {
     startTask(state, projectId, task.id, started.sessionId);
     logger.info('[queue] dispatched task', {
@@ -816,6 +838,7 @@ const dispatch = async (projectId: string, directory: string, task: QueueTask): 
       taskId: task.id,
       sessionId: started.sessionId,
       images: task.images.length,
+      appended: Boolean(task.target),
     });
     return 'run.started';
   }
@@ -1084,6 +1107,9 @@ type Command = {
   taskId?: string;
   direction?: 'top' | 'up' | 'down';
   enabled?: boolean;
+  /** "Append" enqueue: the session the new task should be sent to at dispatch. */
+  targetSessionId?: string;
+  targetSessionTitle?: string;
 };
 
 /** Which event a command reports once it changed something. */
@@ -1105,8 +1131,17 @@ const applyCommand = async (command: Command): Promise<boolean> => {
     case 'register':
       if (!command.directory) return false;
       return registerProject(state, { id: projectId, directory: command.directory, name: command.name ?? projectId });
-    case 'enqueue':
-      return enqueue(state, projectId, command.text ?? '', sanitizeImages(command.images)) !== null;
+    case 'enqueue': {
+      // An "append" task names the session recorded by the panel; a plain
+      // enqueue leaves it off and dispatch creates a session as before.
+      const target: TaskTarget | undefined = command.targetSessionId
+        ? { sessionId: command.targetSessionId, title: command.targetSessionTitle }
+        : undefined;
+      return enqueue(state, projectId, command.text ?? '', {
+        images: sanitizeImages(command.images),
+        target,
+      }) !== null;
+    }
     case 'edit':
       return editTask(state, projectId, command.taskId ?? '', command.text ?? '', sanitizeImages(command.images));
     case 'remove':

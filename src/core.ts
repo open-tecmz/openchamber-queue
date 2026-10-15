@@ -12,6 +12,8 @@
  * A task is its prompt text plus the images attached to it. The bytes never
  * enter this state: an image is a reference into the service's own store (see
  * `TaskImage`), which is what keeps `state.json` small and writable in one go.
+ * A task may also name an existing session (`TaskTarget`) to append to instead
+ * of a new one being created at dispatch.
  */
 
 export type TaskStatus = 'pending' | 'failed';
@@ -68,6 +70,29 @@ export const sanitizeImages = (value: unknown): TaskImage[] => {
   return images;
 };
 
+/**
+ * Where an "append" task goes: a session that already exists, recorded by the
+ * panel when the task was queued — the queue sends the prompt to it at dispatch
+ * instead of creating a new session. The title is kept only so the queue can
+ * show which session a task is bound to; the id is what dispatch uses.
+ */
+export type TaskTarget = {
+  /** OpenChamber/OpenCode session id to append to. */
+  sessionId: string;
+  /** The session's title when the task was queued, for display only. */
+  title?: string;
+};
+
+/** A target a task may carry, or undefined. A session id is the only requirement. */
+const sanitizeTarget = (value: unknown): TaskTarget | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const target = value as Partial<TaskTarget>;
+  if (typeof target.sessionId !== 'string' || !target.sessionId.trim()) return undefined;
+  const sessionId = target.sessionId.trim().slice(0, 256);
+  const title = typeof target.title === 'string' && target.title.trim() ? target.title.trim().slice(0, 200) : undefined;
+  return title ? { sessionId, title } : { sessionId };
+};
+
 export type QueueTask = {
   id: string;
   /** The prompt text. */
@@ -78,6 +103,12 @@ export type QueueTask = {
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
+  /**
+   * Set on a task the user queued to append to an existing session. The panel
+   * records the session that was open when the task was queued; the service
+   * sends the prompt to it at dispatch instead of creating a new session.
+   */
+  target?: TaskTarget;
 };
 
 /**
@@ -225,26 +256,38 @@ const sameImages = (left: readonly TaskImage[], right: readonly TaskImage[]): bo
     image.mime === right[index].mime &&
     image.size === right[index].size);
 
-export const makeTask = (text: string, images: TaskImage[] = [], now = Date.now()): QueueTask => ({
-  id: nextId(),
-  text: text.trim(),
-  images: sanitizeImages(images),
-  status: 'pending',
-  createdAt: now,
-  finishedAt: null,
-  error: null,
-});
+/** What a task carries besides its text. */
+export type TaskOptions = {
+  images?: TaskImage[];
+  /** An existing session to append to instead of creating one. */
+  target?: TaskTarget;
+  now?: number;
+};
+
+export const makeTask = (text: string, options: TaskOptions = {}): QueueTask => {
+  const task: QueueTask = {
+    id: nextId(),
+    text: text.trim(),
+    images: sanitizeImages(options.images),
+    status: 'pending',
+    createdAt: options.now ?? Date.now(),
+    finishedAt: null,
+    error: null,
+  };
+  const target = sanitizeTarget(options.target);
+  if (target) task.target = target;
+  return task;
+};
 
 export const enqueue = (
   state: QueueState,
   projectId: string,
   text: string,
-  images: TaskImage[] = [],
-  now = Date.now(),
+  options: TaskOptions = {},
 ): QueueTask | null => {
   const trimmed = text.trim();
   if (!trimmed) return null;
-  const task = makeTask(trimmed, images, now);
+  const task = makeTask(trimmed, options);
   ensureQueue(state, projectId).tasks.push(task);
   return task;
 };
@@ -485,7 +528,15 @@ export const countTasks = (queue: ProjectQueue): QueueCounts => {
 export const repairQueue = (queue: ProjectQueue): ProjectQueue => {
   queue.tasks = (queue.tasks ?? [])
     .filter((task) => task?.status === 'pending' || task?.status === 'failed')
-    .map((task) => ({ ...task, images: sanitizeImages(task?.images) }));
+    .map((task) => {
+      const next: QueueTask = { ...task, images: sanitizeImages(task?.images) };
+      // An append target that no longer makes sense (a session id of the wrong
+      // shape) is dropped, which turns the task back into an ordinary one.
+      const target = sanitizeTarget(task?.target);
+      if (target) next.target = target;
+      else delete next.target;
+      return next;
+    });
   queue.completed = typeof queue.completed === 'number' && Number.isFinite(queue.completed) ? queue.completed : 0;
   if (queue.active && typeof queue.active.sessionId !== 'string') queue.active = null;
   return queue;

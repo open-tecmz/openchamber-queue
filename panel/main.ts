@@ -19,6 +19,7 @@ import {
   HostRequestError,
   connectHost,
   type HostClient,
+  type SessionSnapshot,
 } from '@openchamber/sdk';
 import {
   applyHostReady,
@@ -83,6 +84,8 @@ let renderKey = '';
 let panelMounted = false;
 let backgroundMounted = false;
 let directoryRef: string | null = null;
+/** The session open in the panel, tracked so an "append" task can target it. */
+let currentSession: SessionSnapshot | null = null;
 let editingId: string | null = null;
 let draftText = '';
 /** The images of the task being edited, as the editor shows them. */
@@ -1223,7 +1226,44 @@ const render = (): void => {
       }),
   });
   disposables.push(addButton);
-  // Attaching is the third action, and the only one that does not send: it is
+  // Append: queue the task to the session open in the panel instead of a new
+  // one. The session id is recorded now, at click time, and the queue sends the
+  // prompt to it once the project is idle.
+  const appendButton = mountButton(composerActions, {
+    label: t('composer.append'),
+    variant: 'outline',
+    size: 'sm',
+    onClick: () =>
+      withLoading(appendButton, async () => {
+        const text = composerDraft.trim();
+        if (!text) return;
+        const session = currentSession;
+        if (!session) {
+          await host.toast({ kind: 'info', message: t('toast.noSession') });
+          return;
+        }
+        if (uploading()) {
+          await host.toast({ kind: 'info', message: t('composer.image.wait') });
+          return;
+        }
+        const images = composerImages.slice();
+        clearComposer();
+        try {
+          await pushCommand({
+            op: 'enqueue',
+            text,
+            images: images.map(toTaskImage),
+            targetSessionId: session.id,
+            targetSessionTitle: session.title,
+          });
+        } catch (error) {
+          restoreComposer(text, images);
+          throw error;
+        }
+      }),
+  });
+  disposables.push(appendButton);
+  // Attaching is the last action, and the only one that does not send: it is
   // here so a task can carry a screenshot without leaving the composer.
   const imageButton = mountButton(composerActions, {
     label: t('composer.image.add'),
@@ -1268,6 +1308,7 @@ const renderTask = (task: QueueTask, position: number): HTMLElement => {
   body.appendChild(el('div', 'qx-row-text', deriveTitle(task.text, t('task.untitled'))));
   const subtitle = [
     statusLabel(task.status),
+    task.target ? t('row.appendTo', { name: task.target.title ?? task.target.sessionId }) : '',
     task.images.length > 0 ? t('composer.image.count', { n: task.images.length }) : '',
     task.error ?? '',
     queue.enabled ? '' : t('row.clickToEdit'),
@@ -1457,6 +1498,12 @@ host.onReady((ctx) => {
   }
   if (panelMounted) return;
   panelMounted = true;
+  currentSession = ctx.session;
+  // The open session changes as the user moves around the app; an append task
+  // must target whatever is open when it is queued, so follow it.
+  host.onSession((session) => {
+    currentSession = session;
+  });
   mountBusyBar();
   directory = ctx.directory;
   // Paint the loading state before the first read answers.
