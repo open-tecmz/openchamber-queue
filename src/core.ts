@@ -137,7 +137,18 @@ export const ACTIVE_GRACE_MS = 15000;
  * finished — makes the count start over, so the next task only runs once the
  * project really is quiet.
  */
-export const DISPATCH_DELAY_MS = 10000;
+export const DISPATCH_DELAY_MS = 30000;
+
+/**
+ * The longer settle window used after a run ends on a question.
+ *
+ * A run whose session stopped to ask the user something is not really done: it
+ * waits for an answer the user has not given yet. Rather than start the next
+ * task straight away — which would run over the question the previous task is
+ * still waiting on — the queue gives the user a few minutes to reply
+ * first.
+ */
+export const QUESTION_DISPATCH_DELAY_MS = 300000;
 
 export const emptyState = (): QueueState => ({
   version: STATE_VERSION,
@@ -398,9 +409,12 @@ export const isOccupied = (activity: SessionActivity): boolean =>
 
 /**
  * Status of the session this queue itself dispatched: `running` while it really
- * executes, `free` as soon as it is idle, gone, or only waiting on a question.
+ * executes, `question` when it only stopped to ask the user something, and
+ * `free` as soon as it is idle or gone. A question neither occupies the project
+ * nor finishes the task, so the caller treats it as a finish — but one that arms
+ * the longer settle window.
  */
-export type ActiveStatus = 'running' | 'free';
+export type ActiveStatus = 'running' | 'free' | 'question';
 
 export type TickObservation = {
   /** True when any non-archived session in the project is occupied. */
@@ -408,11 +422,17 @@ export type TickObservation = {
   activeStatus: ActiveStatus;
   /**
    * How long the project has been continuously free — no queue run in flight
-   * and no occupied session — in milliseconds. The queue waits out
-   * `DISPATCH_DELAY_MS` of this before it starts the next task, so a session
-   * that wakes up inside the window resets the count.
+   * and no occupied session — in milliseconds. The queue waits out the settle
+   * window of this before it starts the next task, so a session that wakes up
+   * inside the window resets the count.
    */
   idleMs: number;
+  /**
+   * The settle window to wait out before the next dispatch. Defaults to
+   * `DISPATCH_DELAY_MS`; a caller arms `QUESTION_DISPATCH_DELAY_MS` after a run
+   * that ended on a question.
+   */
+  settleMs?: number;
 };
 
 export type TickDecision =
@@ -435,8 +455,9 @@ export const planTick = (queue: ProjectQueue, observation: TickObservation): Tic
   if (observation.projectBusy) return { kind: 'wait' };
   // Let the project settle before the next task: only a project that has been
   // free for the whole window counts, so anything that wakes up inside it pushes
-  // the next dispatch out to a fresh window.
-  if (observation.idleMs < DISPATCH_DELAY_MS) return { kind: 'wait' };
+  // the next dispatch out to a fresh window. The window is longer when the run
+  // that just ended was waiting on a question.
+  if (observation.idleMs < (observation.settleMs ?? DISPATCH_DELAY_MS)) return { kind: 'wait' };
   const next = firstPending(queue);
   return next ? { kind: 'dispatch', taskId: next.id } : { kind: 'idle' };
 };

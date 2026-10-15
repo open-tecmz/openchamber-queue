@@ -19,6 +19,7 @@ import {
   ACTIVE_GRACE_MS,
   DISPATCH_DELAY_MS,
   IMAGE_ID,
+  QUESTION_DISPATCH_DELAY_MS,
   clearTasks,
   type QueueEvent,
   type QueueEventType,
@@ -191,6 +192,20 @@ const IMAGE_ORPHAN_MS = (() => {
   const override = Number(process.env.OPENCHAMBER_QUEUE_IMAGE_ORPHAN_MS);
   return Number.isFinite(override) && override > 0 ? override : 10 * 60 * 1000;
 })();
+
+/**
+ * The settle windows before the next dispatch: 30 seconds ordinarily, and 5
+ * minutes after a run that ended on a question. `OPENCHAMBER_QUEUE_DISPATCH_MS`
+ * and `OPENCHAMBER_QUEUE_QUESTION_DISPATCH_MS` shorten them for tests, the same
+ * way `OPENCHAMBER_QUEUE_IMAGE_ORPHAN_MS` shortens the image window.
+ */
+const envDelayMs = (name: string, fallback: number): number => {
+  const override = Number(process.env[name]);
+  return Number.isFinite(override) && override > 0 ? override : fallback;
+};
+
+const DISPATCH_MS = envDelayMs('OPENCHAMBER_QUEUE_DISPATCH_MS', DISPATCH_DELAY_MS);
+const QUESTION_DISPATCH_MS = envDelayMs('OPENCHAMBER_QUEUE_QUESTION_DISPATCH_MS', QUESTION_DISPATCH_DELAY_MS);
 
 /** How often a quiet service still looks for images to let go of. */
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -625,8 +640,9 @@ const observe = async (
 
 /**
  * Status of the session this queue itself dispatched: `running` while it really
- * executes, `free` as soon as it is idle, gone, or only waiting on a question.
- * A backgrounded shell keeps it `running`: the pause is not the end.
+ * executes, `question` when it only stopped to ask the user something, and
+ * `free` as soon as it is idle or gone. A backgrounded shell keeps it `running`:
+ * the pause is not the end.
  */
 const activeStatusFor = async (
   active: ActiveRun,
@@ -641,8 +657,11 @@ const activeStatusFor = async (
     return Date.now() - active.startedAt < ACTIVE_GRACE_MS ? 'running' : 'free';
   }
   if (session.archivedAt) return 'free';
-  // A question does not occupy the project, so it frees the queue as well.
-  return isOccupied(await sessionActivity(session, directory, shells)) ? 'running' : 'free';
+  // A question frees the project, so it ends the run — but it is reported on its
+  // own so the caller can give the user the longer window to answer it.
+  const activity = await sessionActivity(session, directory, shells);
+  if (activity === 'waiting-question') return 'question';
+  return isOccupied(activity) ? 'running' : 'free';
 };
 
 // ---------------------------------------------------------------------------
@@ -840,8 +859,9 @@ const queueHasWork = (queue: ProjectQueue): boolean =>
 
 /**
  * A project's idle clock: the moment it was last seen free, or absent while it
- * is occupied. The queue waits out `DISPATCH_DELAY_MS` of it before the next
- * dispatch, so this is where the settle window is measured from.
+ * is occupied. The queue waits out its settle window of it before the next
+ * dispatch — `DISPATCH_DELAY_MS` ordinarily, `QUESTION_DISPATCH_DELAY_MS` after
+ * a run ended on a question — so this is where that window is measured from.
  */
 const freeSince = new Map<string, number>();
 
@@ -870,13 +890,31 @@ const trackIdle = (projectId: string, free: boolean, now: number): number => {
 };
 
 /**
+ * The settle window to use for a project's next dispatch, when it differs from
+ * `DISPATCH_DELAY_MS`. A run that ended on a question arms the longer
+ * `QUESTION_DISPATCH_DELAY_MS` here; the entry is cleared the moment the project
+ * stops being free or a task is dispatched, so it only ever applies to the
+ * dispatch that follows that one run.
+ */
+const nextSettleMs = new Map<string, number>();
+
+/** The settle window a project's next dispatch must wait out. */
+const settleDelayFor = (projectId: string): number =>
+  nextSettleMs.get(projectId) ?? DISPATCH_MS;
+
+/** Forget a project's armed settle window; it no longer has one to honour. */
+const clearSettle = (projectId: string): void => {
+  nextSettleMs.delete(projectId);
+};
+
+/**
  * Re-evaluate this project the moment its settle window is up, so the next task
- * starts right after `DISPATCH_DELAY_MS` rather than at the next periodic tick.
+ * starts right after it rather than at the next periodic tick.
  */
 const scheduleDispatchCheck = (projectId: string): void => {
   const since = freeSince.get(projectId);
   if (since === undefined) return;
-  const delayMs = Math.max(0, since + DISPATCH_DELAY_MS - Date.now());
+  const delayMs = Math.max(0, since + settleDelayFor(projectId) - Date.now());
   cancelDispatchCheck(projectId);
   const timer = setTimeout(() => {
     dispatchChecks.delete(projectId);
@@ -898,6 +936,7 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
   if (!queueHasWork(getQueue(state, projectId))) {
     // Nothing queued: the settle window only starts once there is work to run.
     freeSince.delete(projectId);
+    clearSettle(projectId);
     cancelDispatchCheck(projectId);
     offlineProjects.delete(projectId);
     return types;
@@ -924,15 +963,28 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
     const observation = await observe(info.directory, sessions, queue.active);
     const now = Date.now();
     const free = queue.active === null && !observation.projectBusy;
-    const decision = planTick(queue, { ...observation, idleMs: trackIdle(projectId, free, now) });
+    // Anything but a free project ends the current window, so a run in flight
+    // cannot carry an armed question window over to the dispatch that follows it.
+    if (!free) clearSettle(projectId);
+    const decision = planTick(queue, {
+      ...observation,
+      idleMs: trackIdle(projectId, free, now),
+      settleMs: settleDelayFor(projectId),
+    });
 
     if (decision.kind === 'finish') {
+      // A run that ended on a question hands the floor to the user: arm the
+      // longer window so the next task does not run over the pending answer. Any
+      // other finish clears it and settles for the ordinary window.
+      if (observation.activeStatus === 'question') nextSettleMs.set(projectId, QUESTION_DISPATCH_MS);
+      else clearSettle(projectId);
       finishRun(state, projectId);
       types.push('run.finished');
       continue;
     }
     if (decision.kind === 'dispatch') {
       cancelDispatchCheck(projectId);
+      clearSettle(projectId);
       const task = queue.tasks.find((entry) => entry.id === decision.taskId);
       if (!task) break;
       types.push(await dispatch(projectId, info.directory, task));

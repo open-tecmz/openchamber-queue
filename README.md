@@ -4,7 +4,7 @@
 
 **A per-project task queue for [OpenChamber](https://openchamber.dev).**
 Add tasks, flip the queue on, and the next task starts on its own once the
-project has been idle for 10 seconds — one task at a time, no clicks per task.
+project has been idle for 30 seconds — one task at a time, no clicks per task.
 
 English · [简体中文](./README.zh-CN.md)
 
@@ -18,7 +18,7 @@ English · [简体中文](./README.zh-CN.md)
 
 A task is **the content** — the prompt — plus the images attached to it. Model,
 agent and variant come from the project's own defaults. A task starts once that
-project has had **no running session for 10 seconds**, so the rail stays quiet
+project has had **no running session for 30 seconds**, so the rail stays quiet
 until there is work to do.
 
 > Built as an OpenChamber **extension** (panel + local service), not an OpenCode plugin.
@@ -43,7 +43,7 @@ until there is work to do.
   it on the panel or picking it with **Add image**; the task carries it and the
   dispatched session receives it as an image on its first prompt.
 - **Automatic dispatch** — a new session is created and the prompt sent once the
-  project has been idle for 10 seconds; no clicks per task.
+  project has been idle for 30 seconds; no clicks per task.
 - **Run now** — a second button sends the draft into a fresh session at once,
   without queueing it.
 - **Run a queued task now** — each row has a *Run* button that starts that
@@ -51,7 +51,8 @@ until there is work to do.
 - **Hand-off queue** — a task is removed and counted in *Done* the moment its
   session is created; an empty queue turns its own switch off.
 - **Questions don't block** — a session waiting on a question does not hold the
-  project, so the next task is dispatched.
+  project: the next task is dispatched, but only after a longer 5-minute window
+  that leaves you room to answer first.
 - **Editable while stopped** — click a task card to edit it in place; edits are
   refused while the queue is running.
 - **Works with the page closed** — the queue is driven by a server-side local
@@ -71,18 +72,20 @@ For each project, every tick:
 1. Queue disabled, or empty → nothing to do.
 2. The session this queue started is still **executing** → wait.
 3. Any **other** session in the project is really executing → wait.
-4. The project must then stay free for **10 seconds**. Anything that wakes up
+4. The project must then stay free for **30 seconds**. Anything that wakes up
    inside that window — a session you start, a retry on the session that just
-   finished — resets the count, so the project has a moment to settle.
+   finished — resets the count, so the project has a moment to settle. When the
+   run that just ended was **waiting on a question**, the window is **5 minutes**
+   instead, giving you time to answer before the next task starts.
 5. Take the first pending task → create a session → send the content. The task
-   leaves the queue and is counted in *Done* right away. The 10-second window
-   starts over before the task after it.
+   leaves the queue and is counted in *Done* right away. The window starts over
+   before the task after it.
 6. When that session stops executing (idle, gone, or asking a question) the
    project is free again and the window restarts. When the queue empties, the
    switch turns itself off.
 
-The 10-second window applies to the first task too: turning the switch on with a
-task waiting starts it 10 seconds later, not instantly.
+The window applies to the first task too: turning the switch on with a task
+waiting starts it 30 seconds later, not instantly.
 
 A task without images is one call: the control API creates the session and sends
 the prompt, which is also what applies the project's default model. A task
@@ -93,7 +96,8 @@ carrying the bytes as a data URL — the same path the app's own composer uses.
 
 "Really executing" means `running`, `retrying` or `waiting-permission`.
 `waiting-question` is **not** considered occupied, so an agent that is asking a
-question never blocks the queue — its task is already handed off — while a session
+question never blocks the queue — its task is already handed off, and the next
+one simply waits out the longer 5-minute window — while a session
 you started yourself does make the queue wait its turn. A session that sent a
 command to the background also counts as executing: it reports idle while the
 command runs, and the queue waits for that command to finish before it moves on.
@@ -142,7 +146,7 @@ Open the **Queue** panel from the extensions area of the rail:
    sent as images on the session's first prompt. A task needs text; the images
    ride along with it.
 3. Turn on **Enable queue**.
-4. Leave it alone. Once the project has been idle for 10 seconds the first task
+4. Leave it alone. Once the project has been idle for 30 seconds the first task
    runs; when it finishes the next one starts.
 
 The header shows the mode and two counters on the right: **pending / done**. Each
