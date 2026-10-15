@@ -36,14 +36,17 @@ import {
 } from '@openchamber/sdk/ui';
 
 import {
+  MAX_IMAGES_PER_TASK,
   countTasks,
   deriveTitle,
   emptyQueue,
   type ProjectInfo,
   type ProjectQueue,
+  type QueueDraft,
   type QueueEvent,
   type QueueSnapshot,
   type QueueTask,
+  type TaskImage,
 } from '../src/core.ts';
 import { createTranslator, type Translator } from '../src/i18n.ts';
 
@@ -82,14 +85,36 @@ let backgroundMounted = false;
 let directoryRef: string | null = null;
 let editingId: string | null = null;
 let draftText = '';
+/** The images of the task being edited, as the editor shows them. */
+let editingImages: ComposerImage[] = [];
+/**
+ * An image the panel holds while the composer does: the reference the service
+ * stores, plus a preview and whether its bytes have arrived yet.
+ */
+type ComposerImage = TaskImage & {
+  /** Small data-URL preview, or null while it is being made. */
+  thumb: string | null;
+  /** True until the bytes are in the service's image store. */
+  uploading: boolean;
+};
+
+/** The composer images for the open project, kept across renders and mirrored to the service. */
+let composerImages: ComposerImage[] = [];
 /** The composer text for the open project, kept across renders and mirrored to the service. */
 let composerDraft = '';
 /** The project `composerDraft` belongs to, so a refresh only adopts the service draft. */
 let composerProject: string | null = null;
-/** True when `composerDraft` has changed since it was last saved. */
+/** True when the composer has changed since it was last saved. */
 let draftDirty = false;
 /** The composer field has focus: hold queue-driven re-renders so typing is never disturbed. */
 let composerFocused = false;
+/**
+ * The strip nodes, kept so a change made while the composer is frozen (a pasted
+ * image) still reaches the screen: the strip redraws itself in place instead of
+ * waiting for the next full render.
+ */
+let composerStrip: HTMLElement | null = null;
+let editorStrip: HTMLElement | null = null;
 /**
  * A frozen composer can hide a queue change. Setting this asks for one repaint
  * after the next click has finished bubbling — see the listener below.
@@ -190,10 +215,14 @@ const backend = {
   async load(projectId: string): Promise<QueueSnapshot> {
     const data = await this.request<Partial<QueueSnapshot>>('GET', '/state', { projectId });
     if (!data.queue) throw new EventsUnsupportedError('service did not return a queue');
+    const draft = data.draft && typeof data.draft === 'object' ? data.draft : { text: '', images: [] };
     return {
       project: data.project ?? null,
       queue: data.queue,
-      draft: typeof data.draft === 'string' ? data.draft : '',
+      draft: {
+        text: typeof draft.text === 'string' ? draft.text : '',
+        images: Array.isArray(draft.images) ? draft.images : [],
+      },
       seq: typeof data.seq === 'number' ? data.seq : 0,
     };
   },
@@ -225,6 +254,34 @@ const backend = {
     );
     return { queue: data.queue ?? null, seq: typeof data.seq === 'number' ? data.seq : 0 };
   },
+  /**
+   * Image uploads. One image travels in chunks because the host caps a single
+   * request body at 64 kB; the service assembles them into its own store.
+   */
+  async imageBegin(id: string, name: string, mime: string): Promise<void> {
+    await this.request('POST', '/image/begin', undefined, JSON.stringify({ id, name, mime }));
+  },
+  async imageChunk(id: string, data: string): Promise<void> {
+    await this.request('POST', '/image/chunk', undefined, JSON.stringify({ id, data }));
+  },
+  async imageEnd(id: string, thumb: string | null): Promise<TaskImage> {
+    const data = await this.request<{ image?: TaskImage }>(
+      'POST',
+      '/image/end',
+      undefined,
+      JSON.stringify({ id, thumb }),
+    );
+    if (!data.image) throw new Error('the service did not return the stored image');
+    return data.image;
+  },
+  async imageAbort(id: string): Promise<void> {
+    await this.request('POST', '/image/abort', undefined, JSON.stringify({ id }));
+  },
+  /** The preview the service kept for an image (a draft restored after a reload). */
+  async thumb(id: string): Promise<string | null> {
+    const data = await this.request<{ thumb?: string | null }>('GET', `/image/${id}/thumb`);
+    return typeof data.thumb === 'string' ? data.thumb : null;
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -240,15 +297,35 @@ const DRAFT_SAVE_MS = 400;
 
 let draftSaveTimer: number | null = null;
 
+/** The stored form of an image the panel holds. */
+const toTaskImage = (image: ComposerImage): TaskImage => ({
+  id: image.id,
+  name: image.name,
+  mime: image.mime,
+  size: image.size,
+});
+
+/** The images a draft should carry: only the ones whose bytes have arrived. */
+const storedComposerImages = (): TaskImage[] =>
+  composerImages.filter((image) => !image.uploading).map(toTaskImage);
+
+/** What the composer holds, as one comparable string. */
+const draftSignature = (): string =>
+  `${composerDraft}\u0000${storedComposerImages().map((image) => image.id).join(',')}`;
+
 /**
  * Write the draft for `projectId` to the service, which owns it on disk. Best
  * effort: a failure is retried by the next keystroke, and nothing depends on it.
  */
-const persistDraft = async (projectId: string, text: string): Promise<void> => {
+const persistDraft = async (
+  projectId: string,
+  draft: QueueDraft,
+  signature: string,
+): Promise<void> => {
   if (mode !== 'backend') return;
   try {
-    await backend.command(projectId, { op: 'set-draft', text });
-    if (composerProject === projectId && composerDraft === text) draftDirty = false;
+    await backend.command(projectId, { op: 'set-draft', text: draft.text, images: draft.images });
+    if (composerProject === projectId && draftSignature() === signature) draftDirty = false;
   } catch {
     // Leave `draftDirty` set so a later keystroke or flush tries again.
   }
@@ -259,10 +336,11 @@ const scheduleDraftSave = (): void => {
   if (!project || mode !== 'backend' || !draftDirty) return;
   if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
   const projectId = project.id;
-  const text = composerDraft;
+  const draft: QueueDraft = { text: composerDraft, images: storedComposerImages() };
+  const signature = draftSignature();
   draftSaveTimer = window.setTimeout(() => {
     draftSaveTimer = null;
-    void persistDraft(projectId, text);
+    void persistDraft(projectId, draft, signature);
   }, DRAFT_SAVE_MS);
 };
 
@@ -272,7 +350,13 @@ const flushDraftSave = (): void => {
     window.clearTimeout(draftSaveTimer);
     draftSaveTimer = null;
   }
-  if (composerProject && draftDirty) void persistDraft(composerProject, composerDraft);
+  if (composerProject && draftDirty) {
+    void persistDraft(
+      composerProject,
+      { text: composerDraft, images: storedComposerImages() },
+      draftSignature(),
+    );
+  }
 };
 
 /** Forget the current draft (a project switch, or the panel going away). */
@@ -282,11 +366,276 @@ const resetDraft = (): void => {
     draftSaveTimer = null;
   }
   composerDraft = '';
+  composerImages = [];
   composerProject = null;
   draftDirty = false;
   composerFocused = false;
   catchUpAfterBlur = false;
+  refreshComposerStrip();
 };
+
+// ---------------------------------------------------------------------------
+// Composer images
+// ---------------------------------------------------------------------------
+
+/**
+ * Images are the one part of a task the panel cannot hand over as plain text.
+ * They are uploaded to the service's own store first (in chunks, because the
+ * host caps one request body at 64 kB) and the task then names them; the queue
+ * state only ever carries the reference.
+ *
+ * Limits mirror the service's, so a file the panel accepts is one it will take.
+ */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const IMAGE_CHUNK_CHARS = 48000;
+/** Longest edge of the preview the strip draws; the session gets the original. */
+const THUMB_MAX_EDGE = 160;
+/**
+ * A preview travels back with the upload in the same request body the host caps
+ * at 64 kB, so a picture that would not fit is drawn smaller or dropped.
+ */
+const THUMB_MAX_CHARS = 40000;
+
+/** `btoa` on a whole image would blow the argument limit: encode in slabs. */
+const bytesToBase64 = (bytes: Uint8Array): string => {
+  let binary = '';
+  const slab = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += slab) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + slab));
+  }
+  return btoa(binary);
+};
+
+/** Draw the bitmap at `edge` px and encode it; null when the canvas refuses. */
+const drawThumb = (bitmap: ImageBitmap, edge: number, quality: number): string | null => {
+  try {
+    const scale = Math.min(1, edge / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext('2d');
+    if (!context) return null;
+    // Screenshots are often transparent PNGs; the strip shows them on white.
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', quality);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * A small preview for the strip. Best effort: an image the browser cannot draw
+ * still uploads, and its chip shows the file name instead.
+ */
+const makeThumbnail = async (file: File): Promise<string | null> => {
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return null;
+  }
+  let thumb = drawThumb(bitmap, THUMB_MAX_EDGE, 0.72);
+  if (thumb && thumb.length > THUMB_MAX_CHARS) thumb = drawThumb(bitmap, 96, 0.6);
+  bitmap.close?.();
+  return thumb && thumb.length <= THUMB_MAX_CHARS ? thumb : null;
+};
+
+const formatMegabytes = (bytes: number): string => `${Math.round(bytes / (1024 * 1024))} MB`;
+
+/** One attached image: its preview, its name and a way to drop it. */
+const imageChip = (image: ComposerImage, onRemove: (() => void) | null): HTMLElement => {
+  const chip = el('div', `qx-image${image.uploading ? ' qx-image-uploading' : ''}`);
+  if (image.thumb) {
+    const thumb = document.createElement('img');
+    thumb.className = 'qx-image-thumb';
+    thumb.src = image.thumb;
+    thumb.alt = '';
+    chip.appendChild(thumb);
+  } else {
+    chip.appendChild(el('span', 'qx-image-thumb qx-image-thumb-empty'));
+  }
+  const name = el('span', 'qx-image-name', image.uploading ? t('composer.image.uploading') : image.name);
+  name.title = image.name;
+  chip.appendChild(name);
+  if (onRemove && !image.uploading) {
+    const remove = el('button', 'qx-image-remove', '\u00d7') as HTMLButtonElement;
+    remove.type = 'button';
+    remove.title = t('composer.image.remove');
+    remove.setAttribute('aria-label', t('composer.image.remove'));
+    remove.addEventListener('click', (event) => {
+      // The row behind the strip may open the editor; dropping an image does not.
+      event.stopPropagation();
+      onRemove();
+    });
+    chip.appendChild(remove);
+  }
+  return chip;
+};
+
+/**
+ * Draw a strip in place. A strip is never rebuilt by a render while the field
+ * it belongs to has focus — the render is held back so typing is not disturbed
+ * — so it redraws itself whenever what it shows changes.
+ */
+const drawImageStrip = (
+  host: HTMLElement,
+  images: readonly ComposerImage[],
+  onRemove: ((id: string) => void) | null,
+): void => {
+  host.textContent = '';
+  host.hidden = images.length === 0;
+  for (const image of images) {
+    host.appendChild(imageChip(image, onRemove ? () => onRemove(image.id) : null));
+  }
+};
+
+const refreshComposerStrip = (): void => {
+  if (composerStrip) drawImageStrip(composerStrip, composerImages, removeComposerImage);
+};
+
+const refreshEditorStrip = (): void => {
+  if (editorStrip) drawImageStrip(editorStrip, editingImages, removeEditorImage);
+};
+
+/** The composer changed: keep it as the draft and write it soon. */
+const touchComposer = (): void => {
+  composerProject = project?.id ?? null;
+  draftDirty = true;
+  scheduleDraftSave();
+};
+
+const removeComposerImage = (id: string): void => {
+  composerImages = composerImages.filter((image) => image.id !== id);
+  refreshComposerStrip();
+  touchComposer();
+};
+
+const removeEditorImage = (id: string): void => {
+  editingImages = editingImages.filter((image) => image.id !== id);
+  refreshEditorStrip();
+};
+
+/** The preview the service kept, for an image restored from a draft. */
+const loadThumb = async (image: ComposerImage, owner: string): Promise<void> => {
+  if (image.thumb) return;
+  try {
+    const thumb = await backend.thumb(image.id);
+    // The composer may have moved on (another project, another draft) since.
+    if (!thumb || composerProject !== owner || !composerImages.includes(image)) return;
+    image.thumb = thumb;
+    refreshComposerStrip();
+  } catch {
+    // No preview: the chip shows the name.
+  }
+};
+
+/**
+ * Upload one image to the service's store. The chip appears at once and shows
+ * that it is still arriving; a failure takes it away again and says so.
+ */
+const uploadImage = async (file: File): Promise<void> => {
+  const id = `img_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const image: ComposerImage = {
+    id,
+    name: file.name || t('composer.image.untitled'),
+    mime: file.type || 'application/octet-stream',
+    size: file.size,
+    thumb: null,
+    uploading: true,
+  };
+  composerImages = [...composerImages, image];
+  refreshComposerStrip();
+  beginPending();
+  let started = false;
+  try {
+    image.thumb = await makeThumbnail(file);
+    refreshComposerStrip();
+    const base64 = bytesToBase64(new Uint8Array(await file.arrayBuffer()));
+    await backend.imageBegin(id, image.name, image.mime);
+    started = true;
+    for (let offset = 0; offset < base64.length; offset += IMAGE_CHUNK_CHARS) {
+      await backend.imageChunk(id, base64.slice(offset, offset + IMAGE_CHUNK_CHARS));
+    }
+    const stored = await backend.imageEnd(id, image.thumb);
+    image.name = stored.name;
+    image.mime = stored.mime;
+    image.size = stored.size;
+    image.uploading = false;
+    // The draft has to name the image for the sweep to keep it.
+    touchComposer();
+  } catch {
+    composerImages = composerImages.filter((entry) => entry.id !== id);
+    if (started) await backend.imageAbort(id).catch(() => undefined);
+    await host.toast({ kind: 'error', message: t('composer.image.failed') });
+  } finally {
+    endPending();
+    refreshComposerStrip();
+  }
+};
+
+/** Attach files the user picked, pasted or dropped. */
+const addImageFiles = async (files: readonly File[]): Promise<void> => {
+  if (!project || mode === 'unknown' || files.length === 0) return;
+  const images = files.filter((file) => file.type.startsWith('image/') && file.size > 0);
+  if (images.length === 0) return;
+  const room = MAX_IMAGES_PER_TASK - composerImages.length;
+  if (images.length > room) {
+    await host.toast({ kind: 'info', message: t('composer.image.tooMany', { n: MAX_IMAGES_PER_TASK }) });
+  }
+  for (const file of images.slice(0, Math.max(0, room))) {
+    if (file.size > MAX_IMAGE_BYTES) {
+      await host.toast({
+        kind: 'error',
+        message: t('composer.image.tooLarge', { max: formatMegabytes(MAX_IMAGE_BYTES) }),
+      });
+      continue;
+    }
+    await uploadImage(file);
+  }
+};
+
+/** A paste that carries an image attaches it instead of being dropped. */
+const handleComposerPaste = (event: ClipboardEvent): void => {
+  const data = event.clipboardData;
+  if (!data) return;
+  const files = [...data.items]
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+  if (files.length === 0) return;
+  // Text in the same paste still lands in the field; the image joins the task.
+  if (!data.getData('text/plain')) event.preventDefault();
+  void addImageFiles(files);
+};
+
+/** The hidden picker behind the "Add image" button. */
+const filePicker = document.createElement('input');
+filePicker.type = 'file';
+filePicker.accept = 'image/*';
+filePicker.multiple = true;
+filePicker.hidden = true;
+filePicker.addEventListener('change', () => {
+  const files = [...(filePicker.files ?? [])];
+  filePicker.value = '';
+  void addImageFiles(files);
+});
+document.body.appendChild(filePicker);
+
+// Dropping an image anywhere on the panel attaches it to the composer.
+document.addEventListener('dragover', (event) => {
+  if (!panelMounted || !event.dataTransfer?.types.includes('Files')) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+});
+document.addEventListener('drop', (event) => {
+  if (!panelMounted) return;
+  const files = [...(event.dataTransfer?.files ?? [])];
+  if (files.length === 0) return;
+  event.preventDefault();
+  void addImageFiles(files);
+});
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -311,15 +660,15 @@ const pushCommand = async (command: Record<string, unknown>): Promise<void> => {
 };
 
 /**
- * "Run now": create a session with the draft text immediately instead of
+ * "Run now": create a session with the composer immediately instead of
  * queueing it. The service owns dispatch, so the command is all this sends.
  */
-const runNow = async (text: string): Promise<boolean> => {
+const runNow = async (text: string, images: TaskImage[]): Promise<boolean> => {
   const trimmed = text.trim();
   if (!trimmed || !project || mode === 'unknown') return false;
   beginPending();
   try {
-    await backend.command(project.id, { op: 'run-now', text: trimmed });
+    await backend.command(project.id, { op: 'run-now', text: trimmed, images });
   } catch (error) {
     await host.toast({ kind: 'error', message: error instanceof Error ? error.message : String(error) });
     return false;
@@ -392,9 +741,13 @@ const refresh = async (): Promise<void> => {
     } else {
       // First read for this project: take the draft the service has on disk,
       // which is what survives a reload, an OpenChamber restart or a hard exit.
-      composerDraft = loaded.draft;
+      composerDraft = loaded.draft.text;
+      composerImages = loaded.draft.images.map((image) => ({ ...image, thumb: null, uploading: false }));
       composerProject = project.id;
       draftDirty = false;
+      // The previews came back as names only; ask the service for its copies.
+      const owner = project.id;
+      for (const image of composerImages) void loadThumb(image, owner);
     }
   } catch (error) {
     // The service may have gone away; switch to the connecting state and let
@@ -595,7 +948,7 @@ const FIELD_DEFAULT_ROWS = 3;
 const mountGrowingField = (
   root: Element,
   initial: TextFieldProps,
-  options: { field?: string; onFocus?: () => void; onBlur?: () => void } = {},
+  options: { field?: string; onFocus?: () => void; onBlur?: () => void; onPaste?: (event: ClipboardEvent) => void } = {},
 ): TextFieldHandle => {
   const field = mountTextField(root, initial);
   const input = root.lastElementChild?.querySelector('textarea.oc-sdk-input') ?? null;
@@ -604,6 +957,7 @@ const mountGrowingField = (
   if (options.field) input.dataset.qxField = options.field;
   if (options.onFocus) input.addEventListener('focus', options.onFocus);
   if (options.onBlur) input.addEventListener('blur', options.onBlur);
+  if (options.onPaste) input.addEventListener('paste', options.onPaste as EventListener);
 
   // A floor for `height: auto` before the element has been laid out, and the
   // size an empty field keeps: the panel can mount while the rail is still
@@ -657,13 +1011,24 @@ const clearDisposables = (): void => {
 const beginEdit = (task: QueueTask): void => {
   editingId = task.id;
   draftText = task.text;
+  editingImages = task.images.map((image) => ({ ...image, thumb: null, uploading: false }));
   renderKey = '';
   render();
+  // The previews are the service's copies; fill them in behind the editor.
+  const owner = task.id;
+  for (const image of editingImages) {
+    void backend.thumb(image.id).then((thumb) => {
+      if (!thumb || editingId !== owner || !editingImages.includes(image)) return;
+      image.thumb = thumb;
+      refreshEditorStrip();
+    }).catch(() => undefined);
+  }
 };
 
 const endEdit = (): void => {
   editingId = null;
   draftText = '';
+  editingImages = [];
   renderKey = '';
   render();
 };
@@ -702,6 +1067,10 @@ const render = (): void => {
 
   clearDisposables();
   root.textContent = '';
+  // Both strips live inside the DOM that was just thrown away; the render below
+  // re-creates the one it needs.
+  composerStrip = null;
+  editorStrip = null;
 
   // The first read can take a moment: show that something is happening instead
   // of an empty rail.
@@ -749,6 +1118,10 @@ const render = (): void => {
   }));
 
   const composer = controls.appendChild(el('div', 'qx-composer'));
+  // The strip sits above the field, the way the app's own composer shows what
+  // is attached. It is drawn in place, not by a render, so an image attached
+  // while the field has focus appears at once.
+  composerStrip = composer.appendChild(el('div', 'qx-images'));
   const field = mountGrowingField(
     composer,
     {
@@ -759,14 +1132,13 @@ const render = (): void => {
       rows: 3,
       onChange: (value) => {
         composerDraft = value;
-        composerProject = project?.id ?? null;
-        draftDirty = true;
         field.update({ value });
-        scheduleDraftSave();
+        touchComposer();
       },
     },
     {
       field: 'composer',
+      onPaste: handleComposerPaste,
       onFocus: () => {
         composerFocused = true;
         // Seal the render key so the next background queue event is a no-op for
@@ -785,21 +1157,30 @@ const render = (): void => {
     },
   );
   disposables.push(field);
+  refreshComposerStrip();
   const composerActions = composer.appendChild(el('div', 'qx-composer-actions'));
-  // Empty the box and persist the empty draft before a command repaints the
-  // panel, so the repaint never resurrects the text it just consumed.
+
+  /** True while an image is still on its way to the service. */
+  const uploading = (): boolean => composerImages.some((image) => image.uploading);
+
+  // Empty the composer and persist it before a command repaints the panel, so
+  // the repaint never resurrects the task it just consumed.
   const clearComposer = (): void => {
     composerDraft = '';
+    composerImages = [];
     composerProject = project?.id ?? null;
     draftDirty = true;
     field.update({ value: '' });
+    refreshComposerStrip();
     flushDraftSave();
   };
-  const restoreComposer = (text: string): void => {
+  const restoreComposer = (text: string, images: ComposerImage[]): void => {
     composerDraft = text;
+    composerImages = images;
     composerProject = project?.id ?? null;
     draftDirty = true;
     field.update({ value: text });
+    refreshComposerStrip();
     scheduleDraftSave();
   };
   const runButton = mountButton(composerActions, {
@@ -810,8 +1191,13 @@ const render = (): void => {
       withLoading(runButton, async () => {
         const text = composerDraft.trim();
         if (!text) return;
+        if (uploading()) {
+          await host.toast({ kind: 'info', message: t('composer.image.wait') });
+          return;
+        }
+        const images = composerImages.slice();
         clearComposer();
-        if (!(await runNow(text))) restoreComposer(text);
+        if (!(await runNow(text, images.map(toTaskImage)))) restoreComposer(text, images);
       }),
   });
   disposables.push(runButton);
@@ -822,16 +1208,30 @@ const render = (): void => {
       withLoading(addButton, async () => {
         const text = composerDraft.trim();
         if (!text) return;
+        if (uploading()) {
+          await host.toast({ kind: 'info', message: t('composer.image.wait') });
+          return;
+        }
+        const images = composerImages.slice();
         clearComposer();
         try {
-          await pushCommand({ op: 'enqueue', text });
+          await pushCommand({ op: 'enqueue', text, images: images.map(toTaskImage) });
         } catch (error) {
-          restoreComposer(text);
+          restoreComposer(text, images);
           throw error;
         }
       }),
   });
   disposables.push(addButton);
+  // Attaching is the third action, and the only one that does not send: it is
+  // here so a task can carry a screenshot without leaving the composer.
+  const imageButton = mountButton(composerActions, {
+    label: t('composer.image.add'),
+    variant: 'ghost',
+    size: 'sm',
+    onClick: () => filePicker.click(),
+  });
+  disposables.push(imageButton);
 
   disposables.push(mountSeparator(controls, {}));
 
@@ -868,6 +1268,7 @@ const renderTask = (task: QueueTask, position: number): HTMLElement => {
   body.appendChild(el('div', 'qx-row-text', deriveTitle(task.text, t('task.untitled'))));
   const subtitle = [
     statusLabel(task.status),
+    task.images.length > 0 ? t('composer.image.count', { n: task.images.length }) : '',
     task.error ?? '',
     queue.enabled ? '' : t('row.clickToEdit'),
   ].filter(Boolean).join(' · ');
@@ -922,6 +1323,8 @@ const renderTask = (task: QueueTask, position: number): HTMLElement => {
 
 const renderEditor = (task: QueueTask): HTMLElement => {
   const card = el('div', 'qx-edit');
+  editorStrip = card.appendChild(el('div', 'qx-images'));
+  refreshEditorStrip();
   const field = mountGrowingField(card, {
     value: draftText,
     multiline: true,
@@ -942,8 +1345,9 @@ const renderEditor = (task: QueueTask): HTMLElement => {
       const text = draftText.trim();
       if (!text) return;
       const id = task.id;
+      const images = editingImages.map(toTaskImage);
       endEdit();
-      void pushCommand({ op: 'edit', taskId: id, text });
+      void pushCommand({ op: 'edit', taskId: id, text, images });
     },
   }));
   disposables.push(mountButton(actions, {

@@ -18,6 +18,7 @@ import path from 'node:path';
 import {
   ACTIVE_GRACE_MS,
   DISPATCH_DELAY_MS,
+  IMAGE_ID,
   clearTasks,
   type QueueEvent,
   type QueueEventType,
@@ -34,9 +35,11 @@ import {
   markFailed,
   moveTask,
   planTick,
+  referencedImageIds,
   registerProject,
   removeTask,
-  repairQueue,
+  repairState,
+  sanitizeImages,
   retryTask,
   setDraft,
   setEnabled,
@@ -44,9 +47,10 @@ import {
   type ActiveRun,
   type ActiveStatus,
   type ProjectQueue,
-  type SessionActivity,
   type QueueState,
   type QueueTask,
+  type SessionActivity,
+  type TaskImage,
   type TickObservation,
 } from '../src/core.ts';
 import { createLogger } from './log.ts';
@@ -61,6 +65,11 @@ if (!PORT || !TOKEN) {
 
 const TICK_MS = 5000;
 const REQUEST_TIMEOUT_MS = 8000;
+/**
+ * A prompt carrying images rides one request whose body is the whole image as
+ * base64, so it is given room the ordinary calls do not need.
+ */
+const DISPATCH_TIMEOUT_MS = 60000;
 const SESSION_LIMIT = 30;
 const MAX_STEPS_PER_TICK = 4;
 
@@ -118,13 +127,9 @@ const readState = async (): Promise<QueueState> => {
     const raw = await fsp.readFile(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw) as QueueState;
     if (!parsed || typeof parsed !== 'object') return emptyState();
-    parsed.projects ??= {};
-    parsed.queues ??= {};
-    parsed.drafts ??= {};
-    for (const queue of Object.values(parsed.queues)) {
-      if (queue && typeof queue === 'object') repairQueue(queue);
-    }
-    return parsed;
+    // Brings an older file forward: tasks gain an empty image list and a draft
+    // stored as a plain string becomes a composer without images.
+    return repairState(parsed);
   } catch {
     return emptyState();
   }
@@ -143,6 +148,109 @@ const persist = (): Promise<void> => {
     }
   });
   return writeChain;
+};
+
+// ---------------------------------------------------------------------------
+// Image store
+// ---------------------------------------------------------------------------
+
+/**
+ * Attachments live beside the state, one file per image: `<data dir>/images/`
+ * holds `<id>` (the bytes), `<id>.thumb` (a small preview data URL the panel
+ * draws) and `<id>.part` while an upload is still arriving. `state.json` only
+ * ever carries `TaskImage` metadata, so it stays small and fast to write.
+ *
+ * The panel has no filesystem access of its own and the host caps one request
+ * body at 64 kB, so an image arrives in chunks: `begin` → `chunk`… → `end`.
+ */
+const IMAGE_DIR = path.join(STATE_DIR, 'images');
+
+/** One image's worth of prompt attachment. Beyond this the panel refuses it. */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Base64 characters accepted in one `chunk`. Kept a multiple of four so every
+ * chunk decodes on its own (base64 quanta never straddle a boundary) and well
+ * under the host's 64 kB request-body cap once the JSON envelope is added.
+ */
+const MAX_IMAGE_CHUNK_CHARS = 48000;
+
+/** A preview is small; anything longer than this is not one. */
+const MAX_THUMB_CHARS = 200000;
+
+/**
+ * How long an image must have been unreferenced before the sweep removes it.
+ *
+ * Measured from the moment the state stopped naming it, never from the file's
+ * own age: the panel clears a draft and enqueues the task in two separate
+ * calls, so an image loses and regains its reference within a moment of a
+ * normal "add to queue", and a picture attached to a task hours ago must not be
+ * deleted in the gap. `OPENCHAMBER_QUEUE_IMAGE_ORPHAN_MS` shortens it for tests.
+ */
+const IMAGE_ORPHAN_MS = (() => {
+  const override = Number(process.env.OPENCHAMBER_QUEUE_IMAGE_ORPHAN_MS);
+  return Number.isFinite(override) && override > 0 ? override : 10 * 60 * 1000;
+})();
+
+/** How often a quiet service still looks for images to let go of. */
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Uploads in flight, so a chunk never arrives for a file we never started. */
+const uploads = new Map<string, ImageSession>();
+
+/**
+ * When each unreferenced image was first seen without a reference. The sweep
+ * runs often (every mutation, and on a timer); the clock is what decides, so an
+ * image that gets its reference back is simply forgotten again.
+ */
+const orphans = new Map<string, number>();
+
+const imagePath = (id: string, suffix = ''): string => path.join(IMAGE_DIR, `${id}${suffix}`);
+
+/** Whether an id may name a file in the store. */
+const isImageId = (value: unknown): value is string => typeof value === 'string' && IMAGE_ID.test(value);
+
+const readJson = async (file: string): Promise<any> => {
+  try {
+    return JSON.parse(await fsp.readFile(file, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Let go of images nothing refers to any more — a task that was deleted or
+ * already dispatched, a composer that was emptied, and the debris of an upload
+ * nobody finished. An image is only removed once it has stayed unreferenced for
+ * the whole orphan window, so the two calls a normal "add to queue" makes (clear
+ * the composer, then enqueue) can never race a deletion.
+ */
+const sweepImages = async (): Promise<void> => {
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(IMAGE_DIR);
+  } catch {
+    return; // no store yet
+  }
+  const referenced = referencedImageIds(state);
+  const now = Date.now();
+  for (const entry of entries) {
+    const id = entry.replace(/\.(part|thumb)$/, '');
+    if (referenced.has(id) || uploads.has(id)) {
+      orphans.delete(id);
+      continue;
+    }
+    const since = orphans.get(id);
+    if (since === undefined) {
+      // First sighting: start its clock. A file the sweep meets again in a
+      // later pass and the state still does not name is the garbage.
+      orphans.set(id, now);
+      continue;
+    }
+    if (now - since < IMAGE_ORPHAN_MS) continue;
+    orphans.delete(id);
+    await fsp.rm(path.join(IMAGE_DIR, entry), { force: true }).catch(() => undefined);
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -354,6 +462,45 @@ const serverGet = async (pathname: string, directory?: string): Promise<JsonResu
   }
 };
 
+/**
+ * POST one JSON body to the OpenChamber server. Used for the session routes the
+ * control API does not cover — a prompt carrying images, which the control
+ * action takes only as text.
+ */
+const serverPost = async (
+  pathname: string,
+  directory: string | undefined,
+  body: unknown,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<JsonResult> => {
+  const current = await ensureTarget();
+  if (!current) return { ok: false, error: 'OpenChamber server not reachable' };
+  try {
+    const response = await withTimeout(`${current.base}${pathname}`, {
+      method: 'POST',
+      headers: {
+        ...authHeaders(current),
+        'Content-Type': 'application/json',
+        ...(directory ? { 'x-opencode-directory': directory } : {}),
+      },
+      body: JSON.stringify(body),
+    }, timeoutMs);
+    if (response.status === 401) {
+      target = null;
+      return { ok: false, error: 'unauthorized' };
+    }
+    const parsed = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = typeof parsed?.error === 'string' ? parsed.error : `POST ${pathname} failed (${response.status})`;
+      return { ok: false, error: message };
+    }
+    return { ok: true, body: parsed };
+  } catch (error) {
+    target = null;
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+};
+
 const control = async (action: string, input: Record<string, unknown>): Promise<JsonResult> => {
   const current = await ensureTarget();
   if (!current) return { ok: false, error: 'OpenChamber server not reachable' };
@@ -499,24 +646,162 @@ const activeStatusFor = async (
 };
 
 // ---------------------------------------------------------------------------
-// Tick
+// Dispatch
 // ---------------------------------------------------------------------------
 
+/** The model/agent/variant a new session should start on, as far as we can tell. */
+type Selection = { model?: string; agent?: string; variant?: string };
+
+const asText = (value: unknown): string | null =>
+  typeof value === 'string' && value.trim() ? value.trim() : null;
+
+/**
+ * The model and agent a session created without a prompt would come out on.
+ *
+ * The control API resolves the project's defaults itself — but only when it is
+ * handed the prompt, and it takes no attachments. An image task therefore
+ * creates its session bare and sends the prompt separately, so the selection
+ * has to be named here. It is read from the host's own settings, the same two
+ * levels the host resolves first (the project's choice, then the global one);
+ * with nothing configured nothing is sent, and OpenCode applies its own default
+ * — which is what the host's own resolution falls back to at the end.
+ */
+const defaultSelection = async (projectId: string, directory: string): Promise<Selection> => {
+  const settings = await readJson(path.join(HOST_DATA_DIR, 'settings.json'));
+  if (!settings || typeof settings !== 'object') return {};
+  const projects = Array.isArray(settings.projects) ? settings.projects : [];
+  const project = projects.find((entry: any) => entry?.id === projectId)
+    ?? projects.find((entry: any) => entry?.path === directory);
+  const pick = (key: 'defaultModel' | 'defaultAgent' | 'defaultVariant'): string | null =>
+    asText(project?.[key]) ?? asText(settings[key]);
+  const selection: Selection = {};
+  const model = pick('defaultModel');
+  const agent = pick('defaultAgent');
+  const variant = pick('defaultVariant');
+  if (model) selection.model = model;
+  if (agent) selection.agent = agent;
+  if (variant) selection.variant = variant;
+  return selection;
+};
+
+/** `provider/model`, the spelling the host's settings store. */
+const splitModel = (value: string): { providerID: string; modelID: string } | null => {
+  const slash = value.indexOf('/');
+  if (slash <= 0 || slash === value.length - 1) return null;
+  return { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) };
+};
+
+/**
+ * Put the resolved selection on a session. In v2 the model and agent belong to
+ * the session rather than to a prompt, so they are switched on before the
+ * prompt goes out — the same two calls the app's own composer makes.
+ */
+const applySelection = async (
+  sessionId: string,
+  directory: string,
+  selection: Selection,
+): Promise<JsonResult> => {
+  const model = selection.model ? splitModel(selection.model) : null;
+  if (model) {
+    const applied = await serverPost(`/api/session/${encodeURIComponent(sessionId)}/model`, directory, {
+      model: {
+        id: model.modelID,
+        providerID: model.providerID,
+        ...(selection.variant ? { variant: selection.variant } : {}),
+      },
+    });
+    if (!applied.ok) return applied;
+  }
+  if (selection.agent) {
+    const applied = await serverPost(`/api/session/${encodeURIComponent(sessionId)}/agent`, directory, {
+      agent: selection.agent,
+    });
+    if (!applied.ok) return applied;
+  }
+  return { ok: true, body: null };
+};
+
+/** One prompt to send: its text and the images that travel with it. */
+type Prompt = { text: string; images: TaskImage[] };
+
+/**
+ * Send one prompt to a session that already exists, with its images.
+ *
+ * The control API's `session.create` takes the prompt as plain text, so an
+ * image task goes the way the app's own composer does: the session is created
+ * first, then the prompt is posted on the session route with one `file` part
+ * per image, each carrying the bytes as a data URL.
+ */
+const sendPrompt = async (sessionId: string, directory: string, prompt: Prompt): Promise<JsonResult> => {
+  const files: Array<{ uri: string; name: string }> = [];
+  for (const image of prompt.images) {
+    const bytes = await fsp.readFile(imagePath(image.id)).catch(() => null);
+    if (!bytes) {
+      return { ok: false, error: `attached image ${image.name} is missing from the image store` };
+    }
+    files.push({ uri: `data:${image.mime};base64,${bytes.toString('base64')}`, name: image.name });
+  }
+  return serverPost(
+    `/api/session/${encodeURIComponent(sessionId)}/prompt`,
+    directory,
+    { text: prompt.text, files },
+    DISPATCH_TIMEOUT_MS,
+  );
+};
+
+/**
+ * Hand one prompt to a new session. A prompt with images needs two calls
+ * (create, then the prompt on the session route); a text-only prompt keeps the
+ * single `session.create` call it always had, which is also what resolves the
+ * project's default model and lets OpenCode auto-title the session.
+ */
+const startSessionFor = async (
+  projectId: string,
+  directory: string,
+  prompt: Prompt,
+): Promise<{ sessionId: string } | { error: string }> => {
+  if (prompt.images.length === 0) {
+    // Deliberately no title: OpenCode only generates a session title from the
+    // first message while the session still carries its default title, so
+    // passing one here would freeze the session to the task's first line and it
+    // would never auto-title. Leaving it out makes a queued run look exactly
+    // like a session started from the UI.
+    const result = await control('session.create', { directory, prompt: prompt.text });
+    if (result.ok && typeof result.body?.sessionId === 'string') return { sessionId: result.body.sessionId };
+    return { error: result.ok ? 'session.create returned no session id' : result.error };
+  }
+
+  const selection = await defaultSelection(projectId, directory);
+  const created = await control('session.create', { directory });
+  if (!created.ok || typeof created.body?.sessionId !== 'string') {
+    return { error: created.ok ? 'session.create returned no session id' : created.error };
+  }
+  const sessionId: string = created.body.sessionId;
+  if (selection.model || selection.agent) {
+    const applied = await applySelection(sessionId, directory, selection);
+    // A session on the wrong model still runs; one that never starts does not.
+    // The host refuses a selection it cannot use, and OpenCode applies its own.
+    if (!applied.ok) logger.warn('[queue] could not set the session selection', applied.error);
+  }
+  const sent = await sendPrompt(sessionId, directory, prompt);
+  if (!sent.ok) return { error: sent.error };
+  return { sessionId };
+};
+
 const dispatch = async (projectId: string, directory: string, task: QueueTask): Promise<QueueEventType> => {
-  // Deliberately no title: OpenCode only generates a session title from the
-  // first message while the session still carries its default title, so passing
-  // one here would freeze the session to the task's first line and it would
-  // never auto-title. Leaving it out makes a queued run look exactly like a
-  // session started from the UI.
-  const result = await control('session.create', { directory, prompt: task.text });
-  if (result.ok && typeof result.body?.sessionId === 'string') {
-    startTask(state, projectId, task.id, result.body.sessionId);
-    logger.info('[queue] dispatched task', { projectId, taskId: task.id, sessionId: result.body.sessionId });
+  const started = await startSessionFor(projectId, directory, { text: task.text, images: task.images });
+  if ('sessionId' in started) {
+    startTask(state, projectId, task.id, started.sessionId);
+    logger.info('[queue] dispatched task', {
+      projectId,
+      taskId: task.id,
+      sessionId: started.sessionId,
+      images: task.images.length,
+    });
     return 'run.started';
   }
-  const reason = result.ok ? 'session.create returned no session id' : result.error;
-  markFailed(state, projectId, task.id, reason);
-  logger.error('[queue] dispatch failed', { projectId, taskId: task.id, reason });
+  markFailed(state, projectId, task.id, started.error);
+  logger.error('[queue] dispatch failed', { projectId, taskId: task.id, reason: started.error });
   return 'task.failed';
 };
 
@@ -535,16 +820,13 @@ const runTask = async (projectId: string, taskId: string): Promise<void> => {
   emit(projectId, type);
 };
 
-/** Create a session for this text right away, bypassing the queue. */
-const runNow = async (projectId: string, text: string): Promise<void> => {
+/** Create a session for this composer right away, bypassing the queue. */
+const runNow = async (projectId: string, text: string, images: TaskImage[]): Promise<void> => {
   const info = state.projects[projectId];
   const trimmed = text.trim();
   if (!info || !trimmed) return;
-  const result = await control('session.create', {
-    directory: info.directory,
-    prompt: trimmed,
-  });
-  if (!result.ok) logger.error('[queue] run-now failed', result.error);
+  const started = await startSessionFor(projectId, info.directory, { text: trimmed, images });
+  if ('error' in started) logger.error('[queue] run-now failed', started.error);
 };
 
 /**
@@ -710,7 +992,12 @@ const tick = async (): Promise<void> => {
     // One project must not stop the sweep or raise an unhandled rejection.
     logger.error('[queue] tick failed', error);
   }
-  if (mutated) await persist();
+  if (mutated) {
+    await persist();
+    // A dispatched task's images are no longer referenced: the sweep starts
+    // their clock now and lets them go once the window has passed.
+    void sweepImages();
+  }
 };
 
 /**
@@ -740,6 +1027,8 @@ type Command = {
   directory?: string;
   name?: string;
   text?: string;
+  /** Image references the panel holds; the bytes are already in the store. */
+  images?: TaskImage[];
   taskId?: string;
   direction?: 'top' | 'up' | 'down';
   enabled?: boolean;
@@ -765,9 +1054,9 @@ const applyCommand = async (command: Command): Promise<boolean> => {
       if (!command.directory) return false;
       return registerProject(state, { id: projectId, directory: command.directory, name: command.name ?? projectId });
     case 'enqueue':
-      return enqueue(state, projectId, command.text ?? '') !== null;
+      return enqueue(state, projectId, command.text ?? '', sanitizeImages(command.images)) !== null;
     case 'edit':
-      return editTask(state, projectId, command.taskId ?? '', command.text ?? '');
+      return editTask(state, projectId, command.taskId ?? '', command.text ?? '', sanitizeImages(command.images));
     case 'remove':
       return removeTask(state, projectId, command.taskId ?? '');
     case 'move':
@@ -784,9 +1073,9 @@ const applyCommand = async (command: Command): Promise<boolean> => {
     case 'set-enabled':
       return setEnabled(state, projectId, command.enabled === true);
     case 'set-draft':
-      return setDraft(state, projectId, command.text ?? '');
+      return setDraft(state, projectId, { text: command.text ?? '', images: sanitizeImages(command.images) });
     case 'run-now':
-      await runNow(projectId, command.text ?? '');
+      await runNow(projectId, command.text ?? '', sanitizeImages(command.images));
       return false;
     case 'tick':
       await tick();
@@ -794,6 +1083,122 @@ const applyCommand = async (command: Command): Promise<boolean> => {
     default:
       return false;
   }
+};
+
+// ---------------------------------------------------------------------------
+// Image uploads
+// ---------------------------------------------------------------------------
+
+type ImageSession = { name: string; mime: string; bytes: number };
+
+/** Base64 characters only: the panel sends chunks of an encoded image. */
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/** A preview is a data URL the panel itself produced. */
+const isThumb = (value: unknown): value is string =>
+  typeof value === 'string' && value.startsWith('data:image/') && value.length <= MAX_THUMB_CHARS;
+
+/** Answer with an error and report the request as handled. */
+const badRequest = (res: http.ServerResponse, status: number, error: string): boolean => {
+  json(res, status, { error });
+  return true;
+};
+
+/**
+ * The image store's HTTP surface.
+ *
+ * The panel holds no filesystem access and the host caps one request body at
+ * 64 kB, so an image arrives in chunks and is assembled here: `begin` opens a
+ * part file, every `chunk` appends to it, and `end` promotes it to the store
+ * and records the preview. The bytes never travel back — the panel only reads
+ * the small preview it may need after a reload. Returns true when the request
+ * was one of these routes.
+ */
+const handleImageRequest = async (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  url: URL,
+): Promise<boolean> => {
+  const thumbMatch = /^\/image\/([^/]+)\/thumb$/.exec(url.pathname);
+  if (thumbMatch && req.method === 'GET') {
+    const id = thumbMatch[1];
+    if (!isImageId(id)) return badRequest(res, 400, 'bad image id');
+    const thumb = await fsp.readFile(imagePath(id, '.thumb'), 'utf8').catch(() => null);
+    json(res, 200, { id, thumb: isThumb(thumb) ? thumb : null });
+    return true;
+  }
+
+  if (url.pathname !== '/image/begin' && url.pathname !== '/image/chunk'
+    && url.pathname !== '/image/end' && url.pathname !== '/image/abort') {
+    return false;
+  }
+  if (req.method !== 'POST') return badRequest(res, 405, 'method not allowed');
+
+  let body: Record<string, unknown> | null = null;
+  try {
+    body = JSON.parse((await readBody(req)) || '{}') as Record<string, unknown>;
+  } catch {
+    return badRequest(res, 400, 'invalid body');
+  }
+  const id = body?.id;
+  if (!isImageId(id)) return badRequest(res, 400, 'bad image id');
+
+  if (url.pathname === '/image/begin') {
+    const name = asText(body?.name) ?? 'image';
+    const mime = asText(body?.mime) ?? 'application/octet-stream';
+    if (uploads.has(id)) return badRequest(res, 409, 'upload already started');
+    await fsp.mkdir(IMAGE_DIR, { recursive: true });
+    await fsp.writeFile(imagePath(id, '.part'), '');
+    uploads.set(id, { name, mime, bytes: 0 });
+    json(res, 200, { ok: true, id });
+    return true;
+  }
+
+  const session = uploads.get(id);
+  if (!session) return badRequest(res, 409, 'upload not started');
+
+  if (url.pathname === '/image/abort') {
+    uploads.delete(id);
+    await fsp.rm(imagePath(id, '.part'), { force: true }).catch(() => undefined);
+    json(res, 200, { ok: true, id });
+    return true;
+  }
+
+  if (url.pathname === '/image/chunk') {
+    const data = typeof body?.data === 'string' ? body.data : '';
+    if (!data || data.length > MAX_IMAGE_CHUNK_CHARS || !BASE64.test(data)) {
+      return badRequest(res, 400, 'bad chunk');
+    }
+    const bytes = Buffer.from(data, 'base64');
+    if (session.bytes + bytes.length > MAX_IMAGE_BYTES) {
+      uploads.delete(id);
+      await fsp.rm(imagePath(id, '.part'), { force: true }).catch(() => undefined);
+      return badRequest(res, 413, `image is larger than ${MAX_IMAGE_BYTES} bytes`);
+    }
+    await fsp.appendFile(imagePath(id, '.part'), bytes);
+    session.bytes += bytes.length;
+    json(res, 200, { ok: true, id, received: session.bytes });
+    return true;
+  }
+
+  // `end`: promote the part file into the store and keep its preview.
+  uploads.delete(id);
+  const image = sanitizeImages([{ id, name: session.name, mime: session.mime, size: session.bytes }])[0];
+  if (!image) {
+    await fsp.rm(imagePath(id, '.part'), { force: true }).catch(() => undefined);
+    return badRequest(res, 400, 'empty image');
+  }
+  const thumb = isThumb(body?.thumb) ? body.thumb : null;
+  try {
+    await fsp.mkdir(IMAGE_DIR, { recursive: true });
+    await fsp.rename(imagePath(id, '.part'), imagePath(id));
+    if (thumb) await fsp.writeFile(imagePath(id, '.thumb'), thumb, 'utf8');
+  } catch (error) {
+    logger.error('[queue] failed to store image', error);
+    return badRequest(res, 500, 'could not store the image');
+  }
+  json(res, 200, { ok: true, image });
+  return true;
 };
 
 // ---------------------------------------------------------------------------
@@ -842,6 +1247,8 @@ const server = http.createServer((req, res) => {
       json(res, 200, { backend: true, projectId, ...snapshot, counts: summarize(queue) });
       return;
     }
+
+    if (await handleImageRequest(req, res, url)) return;
 
     /**
      * The event stream, in batches: everything after `after`, or the events that
@@ -966,6 +1373,10 @@ const server = http.createServer((req, res) => {
       const changed = await applyCommand(command);
       if (command.op !== 'tick' && changed) {
         await persist();
+        // Whatever the change unreferenced (a deleted task, a cleared
+        // composer) starts its orphan clock here; an upload in flight and a
+        // reference that is about to come back are both protected.
+        void sweepImages();
         // A draft is only bookkeeping for the panel that typed it: persist it,
         // but do not emit an event or re-evaluate the project. An echo would
         // race the caret back into the box mid-keystroke, and a draft cannot
@@ -1004,14 +1415,22 @@ server.listen(PORT, '127.0.0.1', () => {
     pid: process.pid,
     port: PORT,
     stateFile: STATE_FILE,
+    imageDir: IMAGE_DIR,
     logFile: logger.file,
   });
 });
 
 void (async () => {
   state = await readState();
+  // Images nothing refers to any more — a store from an older run, a task
+  // dispatched while the service was down — start their clock now and go at the
+  // next pass, once they have been unreferenced for the whole window.
+  void sweepImages();
   const timer = setInterval(() => void tick(), TICK_MS);
   timer.unref?.();
+  // A service with nothing to do still has to let go of old images.
+  const sweeper = setInterval(() => void sweepImages(), SWEEP_INTERVAL_MS);
+  sweeper.unref?.();
   void tick();
 })();
 

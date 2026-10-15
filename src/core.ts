@@ -8,18 +8,86 @@
  * Statuses are only pending / failed: a task leaves the queue the moment its
  * session is created and is counted in `completed`. The dispatched session is
  * remembered as the active run only so nothing else starts while it works.
+ *
+ * A task is its prompt text plus the images attached to it. The bytes never
+ * enter this state: an image is a reference into the service's own store (see
+ * `TaskImage`), which is what keeps `state.json` small and writable in one go.
  */
 
 export type TaskStatus = 'pending' | 'failed';
 
+/**
+ * An image attached to a task or to the composer draft.
+ *
+ * Only this metadata is kept in the state file; the bytes live in the image
+ * store beside it (`<data dir>/images/<id>`), owned by the service. That keeps
+ * `state.json` small and lets a task reference an image that was uploaded once.
+ */
+export type TaskImage = {
+  /** Store key: `img_…`. Never a path — the service joins it under its own dir. */
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+};
+
+/** How many images one task (and one draft) may carry. */
+export const MAX_IMAGES_PER_TASK = 4;
+
+/** Store key shape. Anything else is refused, so an id can never escape the store. */
+export const IMAGE_ID = /^img_[A-Za-z0-9_-]{1,64}$/;
+
+/** A value that can be stored as an image reference, or null. */
+const sanitizeImage = (value: unknown): TaskImage | null => {
+  if (!value || typeof value !== 'object') return null;
+  const image = value as Partial<TaskImage>;
+  if (typeof image.id !== 'string' || !IMAGE_ID.test(image.id)) return null;
+  if (typeof image.name !== 'string') return null;
+  if (typeof image.mime !== 'string') return null;
+  if (typeof image.size !== 'number' || !Number.isFinite(image.size) || image.size <= 0) return null;
+  return {
+    id: image.id,
+    name: image.name.slice(0, 200),
+    mime: image.mime.slice(0, 100),
+    size: image.size,
+  };
+};
+
+/** The image references a list carries, in order, capped and de-duplicated. */
+export const sanitizeImages = (value: unknown): TaskImage[] => {
+  if (!Array.isArray(value)) return [];
+  const images: TaskImage[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    const image = sanitizeImage(entry);
+    if (!image || seen.has(image.id)) continue;
+    seen.add(image.id);
+    images.push(image);
+    if (images.length >= MAX_IMAGES_PER_TASK) break;
+  }
+  return images;
+};
+
 export type QueueTask = {
   id: string;
-  /** The prompt. The only user-authored field. */
+  /** The prompt text. */
   text: string;
+  /** Images sent with the prompt, oldest first. Byte-free: see `TaskImage`. */
+  images: TaskImage[];
   status: TaskStatus;
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
+};
+
+/**
+ * What the user typed for a project but did not queue yet. A draft is a whole
+ * composer, text and images alike, so a reload does not drop the half-typed
+ * task — and so the images it names stay referenced (and are not swept).
+ */
+export type QueueDraft = {
+  text: string;
+  images: TaskImage[];
 };
 
 /** The session the queue itself started, remembered until the project is free. */
@@ -48,11 +116,11 @@ export type QueueState = {
   projects: Record<string, ProjectInfo>;
   queues: Record<string, ProjectQueue>;
   /**
-   * The composer text typed for a project but not yet queued, kept beside its
+   * The composer for a project that has not been queued yet, kept beside its
    * queue so it survives a panel reload, an OpenChamber restart or a hard exit.
    * Natural key is the project id; an empty entry means "no draft".
    */
-  drafts: Record<string, string>;
+  drafts: Record<string, QueueDraft>;
 };
 
 export const STATE_VERSION = 1;
@@ -85,6 +153,9 @@ export const emptyQueue = (): ProjectQueue => ({
   active: null,
 });
 
+/** A composer with nothing in it. */
+export const emptyDraft = (): QueueDraft => ({ text: '', images: [] });
+
 export const deriveTitle = (text: string, fallback = 'Queue task'): string => {
   const firstLine = text.trim().split('\n')[0]?.trim() ?? '';
   if (!firstLine) return fallback;
@@ -112,36 +183,57 @@ export const ensureQueue = (state: QueueState, projectId: string): ProjectQueue 
 export const getQueue = (state: QueueState, projectId: string): ProjectQueue =>
   state.queues[projectId] ?? emptyQueue();
 
-/** The composer draft saved for a project, or an empty string. */
-export const getDraft = (state: QueueState, projectId: string): string =>
-  projectId ? state.drafts[projectId] ?? '' : '';
+/** The composer draft saved for a project, or an empty one. */
+export const getDraft = (state: QueueState, projectId: string, fallback: QueueDraft = emptyDraft()): QueueDraft => {
+  if (!projectId) return { text: fallback.text, images: [...fallback.images] };
+  const draft = state.drafts[projectId];
+  if (!draft) return { text: fallback.text, images: [...fallback.images] };
+  return { text: draft.text, images: [...draft.images] };
+};
 
 /**
  * Save a project's composer draft. Returns false when it did not change, so a
- * caller can skip a state write — a panel that re-sends the same text costs
- * nothing. An empty value is kept as an entry: it is how "the box was cleared"
- * is told apart from "no draft was ever saved".
+ * caller can skip a state write — a panel that re-sends the same draft costs
+ * nothing. An empty draft is kept as an entry: it is how "the composer was
+ * cleared" is told apart from "no draft was ever saved".
  */
-export const setDraft = (state: QueueState, projectId: string, text: string): boolean => {
+export const setDraft = (state: QueueState, projectId: string, draft: QueueDraft): boolean => {
   if (!projectId) return false;
-  if ((state.drafts[projectId] ?? '') === text) return false;
-  state.drafts[projectId] = text;
+  const next: QueueDraft = { text: draft.text, images: sanitizeImages(draft.images) };
+  const current = state.drafts[projectId];
+  if (current && current.text === next.text && sameImages(current.images, next.images)) return false;
+  state.drafts[projectId] = next;
   return true;
 };
 
-export const makeTask = (text: string, now = Date.now()): QueueTask => ({
+const sameImages = (left: readonly TaskImage[], right: readonly TaskImage[]): boolean =>
+  left.length === right.length &&
+  left.every((image, index) =>
+    image.id === right[index].id &&
+    image.name === right[index].name &&
+    image.mime === right[index].mime &&
+    image.size === right[index].size);
+
+export const makeTask = (text: string, images: TaskImage[] = [], now = Date.now()): QueueTask => ({
   id: nextId(),
   text: text.trim(),
+  images: sanitizeImages(images),
   status: 'pending',
   createdAt: now,
   finishedAt: null,
   error: null,
 });
 
-export const enqueue = (state: QueueState, projectId: string, text: string, now = Date.now()): QueueTask | null => {
+export const enqueue = (
+  state: QueueState,
+  projectId: string,
+  text: string,
+  images: TaskImage[] = [],
+  now = Date.now(),
+): QueueTask | null => {
   const trimmed = text.trim();
   if (!trimmed) return null;
-  const task = makeTask(trimmed, now);
+  const task = makeTask(trimmed, images, now);
   ensureQueue(state, projectId).tasks.push(task);
   return task;
 };
@@ -155,12 +247,20 @@ export const removeTask = (state: QueueState, projectId: string, taskId: string)
   return queue.tasks.length !== before;
 };
 
-export const editTask = (state: QueueState, projectId: string, taskId: string, text: string): boolean => {
+export const editTask = (
+  state: QueueState,
+  projectId: string,
+  taskId: string,
+  text: string,
+  images?: TaskImage[],
+): boolean => {
   const queue = state.queues[projectId];
   const task = queue?.tasks.find((entry) => entry.id === taskId);
   const trimmed = text.trim();
   if (!queue || !task || !trimmed) return false;
   task.text = trimmed;
+  // The editor may change the attachments; a text-only edit leaves them alone.
+  if (images !== undefined) task.images = sanitizeImages(images);
   return true;
 };
 
@@ -358,13 +458,64 @@ export const countTasks = (queue: ProjectQueue): QueueCounts => {
 
 /**
  * Bring a queue loaded from disk up to the current schema: tasks from an older
- * `running` status are dropped (their session is still tracked by `active`).
+ * `running` status are dropped (their session is still tracked by `active`),
+ * and an image reference that no longer makes sense is dropped with them.
  */
 export const repairQueue = (queue: ProjectQueue): ProjectQueue => {
-  queue.tasks = (queue.tasks ?? []).filter((task) => task?.status === 'pending' || task?.status === 'failed');
+  queue.tasks = (queue.tasks ?? [])
+    .filter((task) => task?.status === 'pending' || task?.status === 'failed')
+    .map((task) => ({ ...task, images: sanitizeImages(task?.images) }));
   queue.completed = typeof queue.completed === 'number' && Number.isFinite(queue.completed) ? queue.completed : 0;
   if (queue.active && typeof queue.active.sessionId !== 'string') queue.active = null;
   return queue;
+};
+
+/**
+ * Bring a whole state file up to the current schema. The first version stored
+ * the composer as a plain string, so an older file is read as a draft without
+ * images instead of being thrown away.
+ */
+export const repairState = (state: QueueState): QueueState => {
+  state.projects ??= {};
+  state.queues ??= {};
+  state.drafts ??= {};
+  for (const queue of Object.values(state.queues)) {
+    if (queue && typeof queue === 'object') repairQueue(queue);
+  }
+  const drafts: Record<string, QueueDraft> = {};
+  for (const [projectId, stored] of Object.entries(state.drafts as Record<string, unknown>)) {
+    if (typeof stored === 'string') {
+      drafts[projectId] = { text: stored, images: [] };
+      continue;
+    }
+    if (stored && typeof stored === 'object') {
+      const draft = stored as Partial<QueueDraft>;
+      drafts[projectId] = {
+        text: typeof draft.text === 'string' ? draft.text : '',
+        images: sanitizeImages(draft.images),
+      };
+    }
+  }
+  state.drafts = drafts;
+  return state;
+};
+
+/**
+ * Every image id the state still refers to: the tasks in every queue plus the
+ * queued-up composers. Anything else in the image store is garbage the service
+ * may sweep — the ids are the only reference an image file has.
+ */
+export const referencedImageIds = (state: QueueState): Set<string> => {
+  const ids = new Set<string>();
+  for (const queue of Object.values(state.queues ?? {})) {
+    for (const task of queue?.tasks ?? []) {
+      for (const image of task?.images ?? []) ids.add(image.id);
+    }
+  }
+  for (const draft of Object.values(state.drafts ?? {})) {
+    for (const image of draft?.images ?? []) ids.add(image.id);
+  }
+  return ids;
 };
 
 /**
@@ -404,7 +555,7 @@ export type QueueEvent = {
 export type QueueSnapshot = {
   project: ProjectInfo | null;
   queue: ProjectQueue;
-  /** The composer draft saved for this project. */
-  draft: string;
+  /** The composer saved for this project. */
+  draft: QueueDraft;
   seq: number;
 };

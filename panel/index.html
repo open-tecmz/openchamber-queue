@@ -74,8 +74,67 @@
       }
       .qx-composer-actions {
         display: flex;
+        flex-wrap: wrap;
         gap: 8px;
         justify-content: flex-start;
+      }
+      /* What is attached to the composer or to the task being edited. */
+      .qx-images {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .qx-images[hidden] {
+        display: none;
+      }
+      .qx-image {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        padding: 3px 4px 3px 3px;
+        border: 1px solid var(--oc-border);
+        border-radius: var(--oc-radius, 8px);
+        background: var(--oc-elevated, transparent);
+        font-size: 11px;
+      }
+      .qx-image-uploading {
+        opacity: 0.7;
+      }
+      .qx-image-thumb {
+        width: 22px;
+        height: 22px;
+        flex: none;
+        border-radius: 4px;
+        object-fit: cover;
+        display: block;
+      }
+      .qx-image-thumb-empty {
+        border: 1px dashed var(--oc-border);
+      }
+      .qx-image-name {
+        min-width: 0;
+        max-width: 160px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .qx-image-remove {
+        flex: none;
+        width: 16px;
+        height: 16px;
+        padding: 0;
+        border: 0;
+        border-radius: 50%;
+        background: transparent;
+        color: var(--oc-muted);
+        font: inherit;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .qx-image-remove:hover {
+        background: var(--oc-hover);
+        color: var(--oc-fg);
       }
       .qx-list {
         /* The queue is the region that gives and takes: a large shrink factor

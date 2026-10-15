@@ -16,10 +16,10 @@ English · [简体中文](./README.zh-CN.md)
 
 </div>
 
-A task has a single field: **the content**, which is the prompt. Model, agent and
-variant come from the project's own defaults. A task starts once that project has
-had **no running session for 10 seconds**, so the rail stays quiet until there is
-work to do.
+A task is **the content** — the prompt — plus the images attached to it. Model,
+agent and variant come from the project's own defaults. A task starts once that
+project has had **no running session for 10 seconds**, so the rail stays quiet
+until there is work to do.
 
 > Built as an OpenChamber **extension** (panel + local service), not an OpenCode plugin.
 
@@ -39,6 +39,9 @@ work to do.
 ## Features
 
 - **One queue per project** — switching projects switches queues.
+- **Images travel with the task** — attach a screenshot by pasting it, dropping
+  it on the panel or picking it with **Add image**; the task carries it and the
+  dispatched session receives it as an image on its first prompt.
 - **Automatic dispatch** — a new session is created and the prompt sent once the
   project has been idle for 10 seconds; no clicks per task.
 - **Run now** — a second button sends the draft into a fresh session at once,
@@ -53,10 +56,10 @@ work to do.
   refused while the queue is running.
 - **Works with the page closed** — the queue is driven by a server-side local
   service, not by the browser tab.
-- **Keystrokes aren't lost** — the composer is kept per project as a draft and
-  written to the local service, so a reload, an OpenChamber restart or a hard
-  exit restores what you were typing; a background queue change never wipes a
-  half-typed task.
+- **Keystrokes aren't lost** — the composer is kept per project as a draft
+  (images included) and written to the local service, so a reload, an OpenChamber
+  restart or a hard exit restores what you were typing; a background queue change
+  never wipes a half-typed task.
 - **Localized panel** — follows the OpenChamber language (English, 简体中文, 繁體中文).
 
 ## How it works
@@ -80,6 +83,13 @@ For each project, every tick:
 
 The 10-second window applies to the first task too: turning the switch on with a
 task waiting starts it 10 seconds later, not instantly.
+
+A task without images is one call: the control API creates the session and sends
+the prompt, which is also what applies the project's default model. A task
+**with** images cannot go through it (that call takes text only), so the session
+is created first, the project's default model and agent are switched onto it, and
+the prompt then goes out on the session's own route with one file part per image,
+carrying the bytes as a data URL — the same path the app's own composer uses.
 
 "Really executing" means `running`, `retrying` or `waiting-permission`.
 `waiting-question` is **not** considered occupied, so an agent that is asking a
@@ -127,15 +137,20 @@ Open the **Queue** panel from the extensions area of the rail:
 
 1. Type a task in the box → **Run now** to start a session immediately, or
    **Add to queue** to line it up.
-2. Turn on **Enable queue**.
-3. Leave it alone. Once the project has been idle for 10 seconds the first task
+2. Optionally attach up to four images: paste a screenshot into the box, drop
+   files on the panel, or press **Add image**. They travel with the task and are
+   sent as images on the session's first prompt. A task needs text; the images
+   ride along with it.
+3. Turn on **Enable queue**.
+4. Leave it alone. Once the project has been idle for 10 seconds the first task
    runs; when it finishes the next one starts.
 
 The header shows the mode and two counters on the right: **pending / done**. Each
-row has *Run*, *Top*, *Retry* (failed only) and *Delete*. *Run* starts that task's
-session immediately and removes it from the queue, without waiting for the project
-to be idle. With the queue stopped, click a row to expand it into an editor with
-**Save** / **Cancel**.
+row has *Run*, *Top*, *Retry* (failed only) and *Delete*, and shows how many
+images the task carries. *Run* starts that task's session immediately and removes
+it from the queue, without waiting for the project to be idle. With the queue
+stopped, click a row to expand it into an editor with **Save** / **Cancel** —
+there the text can be changed and an image dropped with the × on its chip.
 
 Other ways to add a task:
 
@@ -147,13 +162,19 @@ Other ways to add a task:
 | Data | Location |
 | --- | --- |
 | Queue state | `~/.config/openchamber-queue/state.json`, or `$OPENCHAMBER_QUEUE_DATA_DIR/state.json` |
+| Attached images | `~/.config/openchamber-queue/images/<id>` (with a `<id>.thumb` preview) |
 | Diagnostic logs | `~/.config/openchamber-queue/logs/service.log`, or `$OPENCHAMBER_QUEUE_LOG_DIR/service.log` |
 | Install record and grants | `<OpenChamber data dir>/extensions.json` |
 
-The queue keeps its own file *beside* the host's data dir — never inside
+The queue keeps its own files *beside* the host's data dir — never inside
 a project. The host data dir is `~/.config/openchamber`, unless `OPENCHAMBER_DATA_DIR`
 is set on the host (a service process does not receive that variable, so a custom
 host dir is not mirrored).
+
+An attached image is written once, when it is attached, and the task only stores
+its name, type and size — the bytes never enter `state.json`. An image nothing
+refers to any more (its task was deleted, its composer was cleared) is removed by
+the service's own sweep ten minutes later, so the directory stays bounded.
 
 The service writes what it does to `logs/service.log`, which is the first place to
 look when a dispatch or a session did not behave as expected. The active file rolls
@@ -189,6 +210,11 @@ panel stays on the connecting state until it is.
 - **Non-public interface** — the service uses the product's own control API and
   proxied OpenCode session routes. These are what the bundled CLI uses, but they are
   not a guest-facing contract and may change between OpenChamber versions.
+- **Images** — up to four per task, 5 MB each, and they only help with a model that
+  reads images. An image task is created without the control API's own default
+  resolution, so the project's default model and agent are read from OpenChamber's
+  settings and switched onto the session; with neither configured, OpenCode's own
+  default applies.
 - **A task counts as done when it is handed off** — the queue sends the prompt but
   cannot tell whether the agent succeeded. Check the session in OpenChamber for the
   result.
