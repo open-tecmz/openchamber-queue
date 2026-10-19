@@ -44,6 +44,7 @@ import {
   retryTask,
   setDraft,
   setEnabled,
+  setTaskEnabled,
   startTask,
   type ActiveRun,
   type ActiveStatus,
@@ -1097,7 +1098,7 @@ const evaluateProject = (projectId: string): void => {
 // ---------------------------------------------------------------------------
 
 type Command = {
-  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'run-now' | 'set-draft' | 'tick';
+  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'set-task-enabled' | 'run-now' | 'set-draft' | 'tick';
   projectId?: string;
   directory?: string;
   name?: string;
@@ -1106,6 +1107,7 @@ type Command = {
   images?: TaskImage[];
   taskId?: string;
   direction?: 'top' | 'up' | 'down';
+  /** The queue switch for `set-enabled`, or the new task's own switch for `enqueue`. */
   enabled?: boolean;
   /** "Append" enqueue: the session the new task should be sent to at dispatch. */
   targetSessionId?: string;
@@ -1122,6 +1124,7 @@ const COMMAND_EVENTS: Partial<Record<Command['op'], QueueEventType>> = {
   retry: 'task.retried',
   clear: 'queue.cleared',
   'set-enabled': 'queue.enabled',
+  'set-task-enabled': 'task.enabled',
 };
 
 const applyCommand = async (command: Command): Promise<boolean> => {
@@ -1140,6 +1143,7 @@ const applyCommand = async (command: Command): Promise<boolean> => {
       return enqueue(state, projectId, command.text ?? '', {
         images: sanitizeImages(command.images),
         target,
+        enabled: command.enabled !== false,
       }) !== null;
     }
     case 'edit':
@@ -1159,6 +1163,8 @@ const applyCommand = async (command: Command): Promise<boolean> => {
       return clearTasks(state, projectId);
     case 'set-enabled':
       return setEnabled(state, projectId, command.enabled === true);
+    case 'set-task-enabled':
+      return setTaskEnabled(state, projectId, command.taskId ?? '', command.enabled === true);
     case 'set-draft':
       return setDraft(state, projectId, { text: command.text ?? '', images: sanitizeImages(command.images) });
     case 'run-now':

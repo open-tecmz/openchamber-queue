@@ -26,6 +26,7 @@ import {
   mountBadge,
   mountBanner,
   mountButton,
+  mountCheckbox,
   mountEmpty,
   mountSeparator,
   mountSpinner,
@@ -105,6 +106,12 @@ type ComposerImage = TaskImage & {
 let composerImages: ComposerImage[] = [];
 /** The composer text for the open project, kept across renders and mirrored to the service. */
 let composerDraft = '';
+/**
+ * Whether a task added from the composer starts enabled. It is the checkbox at
+ * the end of the composer's caption line and only a panel preference, so it is
+ * not persisted: the task carries it at enqueue and the queue stores it, per task.
+ */
+let newTaskEnabled = true;
 /** The project `composerDraft` belongs to, so a refresh only adopts the service draft. */
 let composerProject: string | null = null;
 /** True when the composer has changed since it was last saved. */
@@ -951,13 +958,21 @@ const FIELD_DEFAULT_ROWS = 3;
 const mountGrowingField = (
   root: Element,
   initial: TextFieldProps,
-  options: { field?: string; onFocus?: () => void; onBlur?: () => void; onPaste?: (event: ClipboardEvent) => void } = {},
+  options: {
+    field?: string;
+    /** Accessible name, for a field whose caption is drawn by the caller. */
+    ariaLabel?: string;
+    onFocus?: () => void;
+    onBlur?: () => void;
+    onPaste?: (event: ClipboardEvent) => void;
+  } = {},
 ): TextFieldHandle => {
   const field = mountTextField(root, initial);
   const input = root.lastElementChild?.querySelector('textarea.oc-sdk-input') ?? null;
   if (!(input instanceof HTMLTextAreaElement)) return field;
 
   if (options.field) input.dataset.qxField = options.field;
+  if (options.ariaLabel) input.setAttribute('aria-label', options.ariaLabel);
   if (options.onFocus) input.addEventListener('focus', options.onFocus);
   if (options.onBlur) input.addEventListener('blur', options.onBlur);
   if (options.onPaste) input.addEventListener('paste', options.onPaste as EventListener);
@@ -1125,10 +1140,24 @@ const render = (): void => {
   // is attached. It is drawn in place, not by a render, so an image attached
   // while the field has focus appears at once.
   composerStrip = composer.appendChild(el('div', 'qx-images'));
+  // The field's caption is drawn here rather than by the SDK, so the "new tasks
+  // are enabled" switch can sit at the end of that same line: the SDK wraps its
+  // label in the field's own <label>, where another control would take over the
+  // click meant for the input.
+  const composerHead = composer.appendChild(el('div', 'qx-composer-head'));
+  composerHead.appendChild(el('span', 'qx-composer-label', t('composer.label')));
+  const newTaskBox = mountCheckbox(composerHead, {
+    label: t('composer.enabled'),
+    checked: newTaskEnabled,
+    onChange: (next) => {
+      newTaskEnabled = next;
+      newTaskBox.update({ checked: next });
+    },
+  });
+  disposables.push(newTaskBox);
   const field = mountGrowingField(
     composer,
     {
-      label: t('composer.label'),
       value: composerDraft,
       placeholder: t('composer.placeholder'),
       multiline: true,
@@ -1141,6 +1170,7 @@ const render = (): void => {
     },
     {
       field: 'composer',
+      ariaLabel: t('composer.label'),
       onPaste: handleComposerPaste,
       onFocus: () => {
         composerFocused = true;
@@ -1218,7 +1248,7 @@ const render = (): void => {
         const images = composerImages.slice();
         clearComposer();
         try {
-          await pushCommand({ op: 'enqueue', text, images: images.map(toTaskImage) });
+          await pushCommand({ op: 'enqueue', text, images: images.map(toTaskImage), enabled: newTaskEnabled });
         } catch (error) {
           restoreComposer(text, images);
           throw error;
@@ -1253,6 +1283,7 @@ const render = (): void => {
             op: 'enqueue',
             text,
             images: images.map(toTaskImage),
+            enabled: newTaskEnabled,
             targetSessionId: session.id,
             targetSessionTitle: session.title,
           });
@@ -1300,14 +1331,16 @@ const render = (): void => {
 
 const renderTask = (task: QueueTask, position: number): HTMLElement => {
   if (editingId === task.id) return renderEditor(task);
-  const row = el('div', `qx-row qx-row-${task.status}${queue.enabled ? '' : ' qx-row-editable'}`);
+  const row = el('div', `qx-row qx-row-${task.status}${task.enabled ? '' : ' qx-row-disabled'}${queue.enabled ? '' : ' qx-row-editable'}`);
   row.appendChild(el('span', `qx-dot qx-dot-${task.status}`));
   row.appendChild(el('span', 'qx-pos', String(position)));
 
   const body = row.appendChild(el('div', 'qx-row-body'));
-  body.appendChild(el('div', 'qx-row-text', deriveTitle(task.text, t('task.untitled'))));
+  // The whole content, not just its first line: the row clamps it to three
+  // lines, so a task can be read without opening the editor.
+  body.appendChild(el('div', 'qx-row-text', task.text.trim() || t('task.untitled')));
   const subtitle = [
-    statusLabel(task.status),
+    task.enabled ? statusLabel(task.status) : t('status.disabled'),
     task.target ? t('row.appendTo', { name: task.target.title ?? task.target.sessionId }) : '',
     task.images.length > 0 ? t('composer.image.count', { n: task.images.length }) : '',
     task.error ?? '',
@@ -1351,6 +1384,15 @@ const renderTask = (task: QueueTask, position: number): HTMLElement => {
     onClick: () => withLoading(removeButton, () => pushCommand({ op: 'remove', taskId: task.id })),
   });
   disposables.push(removeButton);
+  // The task's own switch, last in the bar: it is a setting rather than an
+  // action, so switching it off leaves the task in place and only keeps the
+  // scheduler from starting it. It works whether the queue is running or not.
+  const enabledBox = mountCheckbox(actions, {
+    label: t('row.enabled'),
+    checked: task.enabled,
+    onChange: (next) => void pushCommand({ op: 'set-task-enabled', taskId: task.id, enabled: next }),
+  });
+  disposables.push(enabledBox);
 
   row.addEventListener('click', () => {
     if (queue.enabled) {

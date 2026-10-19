@@ -51,6 +51,14 @@ until there is work to do.
   that session when the project is idle instead of creating a new one.
 - **Run a queued task now** — each row has a *Run* button that starts that
   task's session immediately and removes it from the queue, counting it in *Done*.
+- **Per-task switch** — each row has an *Enabled* checkbox at the end of its
+  actions. A task switched off keeps its place in the queue but the scheduler
+  passes over it; *Run* still starts it by hand. The *New task* line carries the
+  same switch for tasks you are about to add: whatever it is set to is how they
+  come out, and you can still flip any one of them afterwards.
+- **Three-line summary** — every task shows its content as a short summary of up
+  to three lines, line breaks and all, so a longer prompt is readable without
+  opening the editor.
 - **Hand-off queue** — a task is removed and counted in *Done* the moment its
   session is created; an empty queue turns its own switch off.
 - **Questions don't block** — a session waiting on a question does not hold the
@@ -80,9 +88,10 @@ For each project, every tick:
    finished — resets the count, so the project has a moment to settle. When the
    run that just ended was **waiting on a question**, the window is **5 minutes**
    instead, giving you time to answer before the next task starts.
-5. Take the first pending task → create a session → send the content. The task
-   leaves the queue and is counted in *Done* right away. The window starts over
-   before the task after it.
+5. Take the first pending task that is **still enabled** → create a session →
+   send the content. A task switched off keeps its place and is passed over, so
+   the enabled task behind it runs instead. The task leaves the queue and is
+   counted in *Done* right away. The window starts over before the task after it.
 6. When that session stops executing (idle, gone, or asking a question) the
    project is free again and the window restarts. When the queue empties, the
    switch turns itself off.
@@ -157,11 +166,17 @@ Open the **Queue** panel from the extensions area of the rail:
    runs; when it finishes the next one starts.
 
 The header shows the mode and two counters on the right: **pending / done**. Each
-row has *Run*, *Top*, *Retry* (failed only) and *Delete*, and shows how many
-images the task carries. *Run* starts that task's session immediately and removes
-it from the queue, without waiting for the project to be idle. With the queue
-stopped, click a row to expand it into an editor with **Save** / **Cancel** —
-there the text can be changed and an image dropped with the × on its chip.
+row shows the task content as a three-line summary and has *Run*, *Top*, *Retry*
+(failed only) and *Delete*, plus an *Enabled* checkbox and how many images the
+task carries. *Run* starts that task's session immediately and removes it from
+the queue, without waiting for the project to be idle. The *Enabled* checkbox is
+that task's own switch for automatic dispatch: uncheck it and the scheduler
+skips the task, leaving it in its place — a manual *Run* still works. The *New
+task* line has the same checkbox for tasks you are about to add: it decides
+whether they start enabled (on by default), so you can queue a batch to review
+before any of it runs. With the queue stopped, click a row to expand it into an
+editor with **Save** / **Cancel** — there the text can be changed and an image
+dropped with the × on its chip.
 
 Other ways to add a task:
 

@@ -9,7 +9,8 @@
  * session is created and is counted in `completed`. The dispatched session is
  * remembered as the active run only so nothing else starts while it works.
  *
- * A task is its prompt text plus the images attached to it. The bytes never
+ * A task is its prompt text plus the images attached to it, and a switch the
+ * user can turn off so the scheduler passes over it. The bytes never
  * enter this state: an image is a reference into the service's own store (see
  * `TaskImage`), which is what keeps `state.json` small and writable in one go.
  * A task may also name an existing session (`TaskTarget`) to append to instead
@@ -100,6 +101,14 @@ export type QueueTask = {
   /** Images sent with the prompt, oldest first. Byte-free: see `TaskImage`. */
   images: TaskImage[];
   status: TaskStatus;
+  /**
+   * Whether the scheduler may dispatch this task on its own. A task switched
+   * off stays in the queue, in its place, but is skipped when the next task is
+   * picked — so it neither starts a session nor blocks the ones behind it. It
+   * can still be started by hand with Run. Older tasks without the field are
+   * treated as enabled, which is what the queue always did.
+   */
+  enabled: boolean;
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
@@ -261,6 +270,8 @@ export type TaskOptions = {
   images?: TaskImage[];
   /** An existing session to append to instead of creating one. */
   target?: TaskTarget;
+  /** Whether the scheduler may start the new task on its own; defaults to true. */
+  enabled?: boolean;
   now?: number;
 };
 
@@ -270,6 +281,7 @@ export const makeTask = (text: string, options: TaskOptions = {}): QueueTask => 
     text: text.trim(),
     images: sanitizeImages(options.images),
     status: 'pending',
+    enabled: options.enabled !== false,
     createdAt: options.now ?? Date.now(),
     finishedAt: null,
     error: null,
@@ -352,6 +364,24 @@ export const retryTask = (state: QueueState, projectId: string, taskId: string, 
   return true;
 };
 
+/**
+ * Switch one task on or off for the scheduler. Returns false when nothing
+ * changed, so a caller can skip the state write and the event. Switching a task
+ * off never touches the queue's own switch: the two are independent, and a
+ * stopped queue with tasks switched off simply has nothing to start.
+ */
+export const setTaskEnabled = (
+  state: QueueState,
+  projectId: string,
+  taskId: string,
+  enabled: boolean,
+): boolean => {
+  const task = state.queues[projectId]?.tasks.find((entry) => entry.id === taskId);
+  if (!task || task.enabled === enabled) return false;
+  task.enabled = enabled;
+  return true;
+};
+
 export const clearTasks = (state: QueueState, projectId: string): boolean => {
   const queue = state.queues[projectId];
   if (!queue) return false;
@@ -381,8 +411,13 @@ export const registerProject = (state: QueueState, project: ProjectInfo): boolea
   return true;
 };
 
+/**
+ * The next task the scheduler may start: the first pending task that is still
+ * switched on. A task the user switched off is skipped, not moved — it keeps
+ * its place and its turn behind the ones that are on.
+ */
 export const firstPending = (queue: ProjectQueue): QueueTask | null =>
-  queue.tasks.find((task) => task.status === 'pending') ?? null;
+  queue.tasks.find((task) => task.status === 'pending' && task.enabled) ?? null;
 
 /**
  * Hand a task over to a session: it leaves the queue at once (counted as done),
@@ -529,7 +564,13 @@ export const repairQueue = (queue: ProjectQueue): ProjectQueue => {
   queue.tasks = (queue.tasks ?? [])
     .filter((task) => task?.status === 'pending' || task?.status === 'failed')
     .map((task) => {
-      const next: QueueTask = { ...task, images: sanitizeImages(task?.images) };
+      // A task written before tasks could be switched off has no `enabled` and
+      // stays on, which is what every such task was until now.
+      const next: QueueTask = {
+        ...task,
+        images: sanitizeImages(task?.images),
+        enabled: task?.enabled !== false,
+      };
       // An append target that no longer makes sense (a session id of the wrong
       // shape) is dropped, which turns the task back into an ordinary one.
       const target = sanitizeTarget(task?.target);
@@ -603,6 +644,8 @@ export type QueueEventType =
   | 'task.removed'
   | 'task.moved'
   | 'task.retried'
+  /** One task switched on or off for the scheduler — not the queue's own switch. */
+  | 'task.enabled'
   | 'run.started'
   | 'run.finished'
   | 'task.failed';

@@ -72,6 +72,18 @@
         gap: 8px;
         flex: none;
       }
+      /* The composer's caption line: the field label on the left, the "new tasks
+         are enabled" switch on the right. */
+      .qx-composer-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .qx-composer-label {
+        font-size: 0.8125rem;
+        font-weight: 500;
+      }
       .qx-composer-actions {
         display: flex;
         flex-wrap: wrap;
@@ -166,14 +178,26 @@
       .qx-row-editable:hover {
         background: var(--oc-hover);
       }
+      /* A task switched off for the scheduler: still in the list, in its place
+         and editable, just muted so it reads as "will not start on its own". */
+      .qx-row-disabled .qx-row-text {
+        color: var(--oc-muted);
+      }
       .qx-row-body {
         flex: 1;
         min-width: 0;
       }
       .qx-row-text {
-        white-space: nowrap;
+        /* The content reads as a short summary: up to three lines, keeping its
+           own line breaks, so a longer task is legible without opening the
+           editor. Whatever is past the third line is clipped. */
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 3;
+        line-clamp: 3;
         overflow: hidden;
-        text-overflow: ellipsis;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
       }
       .qx-row-sub {
         color: var(--oc-muted);
@@ -186,6 +210,25 @@
         display: flex;
         gap: 4px;
         flex: none;
+        align-items: center;
+      }
+      /* A compact checkbox beside the small action buttons (per task) and on the
+         composer caption line: the SDK default is a full-width block with a
+         14px label, which is too large for either. */
+      .qx-row-actions .oc-sdk-check,
+      .qx-composer-head .oc-sdk-check {
+        width: auto;
+        align-items: center;
+        gap: 4px;
+      }
+      .qx-row-actions .oc-sdk-check-box,
+      .qx-composer-head .oc-sdk-check-box {
+        margin-top: 0;
+      }
+      .qx-row-actions .oc-sdk-check-label,
+      .qx-composer-head .oc-sdk-check-label {
+        font-size: 11px;
+        white-space: nowrap;
       }
       .qx-pos {
         color: var(--oc-muted);
