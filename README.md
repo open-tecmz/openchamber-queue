@@ -4,7 +4,8 @@
 
 **A per-project task queue for [OpenChamber](https://openchamber.dev).**
 Add tasks, flip the queue on, and the next task starts on its own once the
-project has been idle for 30 seconds — one task at a time, no clicks per task.
+project has been idle for the queue's wait — 30 seconds by default, adjustable
+per project — one task at a time, no clicks per task.
 
 English · [简体中文](./README.zh-CN.md)
 
@@ -18,8 +19,8 @@ English · [简体中文](./README.zh-CN.md)
 
 A task is **the content** — the prompt — plus the images attached to it. Model,
 agent and variant come from the project's own defaults. A task starts once that
-project has had **no running session for 30 seconds**, so the rail stays quiet
-until there is work to do.
+project has been idle for the queue's wait (30 seconds by default), so the rail
+stays quiet until there is work to do.
 
 > Built as an OpenChamber **extension** (panel + local service), not an OpenCode plugin.
 
@@ -43,7 +44,13 @@ until there is work to do.
   it on the panel or picking it with **Add image**; the task carries it and the
   dispatched session receives it as an image on its first prompt.
 - **Automatic dispatch** — a new session is created and the prompt sent once the
-  project has been idle for 30 seconds; no clicks per task.
+  project has been idle for the queue's wait (30 seconds by default); no clicks
+  per task.
+- **Dispatch settings, per project** — the idle wait and the longer wait after a
+  question are set in seconds, and so are the conditions that count as busy: a
+  session asking a question, waiting for permission or running a background
+  command, and other sessions in the project. The panel keeps the values in
+  `state.json` with the queue.
 - **Run now** — a second button sends the draft into a fresh session at once,
   without queueing it.
 - **Append to the current session** — a third button queues the draft against the
@@ -83,11 +90,13 @@ For each project, every tick:
 1. Queue disabled, or empty → nothing to do.
 2. The session this queue started is still **executing** → wait.
 3. Any **other** session in the project is really executing → wait.
-4. The project must then stay free for **30 seconds**. Anything that wakes up
-   inside that window — a session you start, a retry on the session that just
-   finished — resets the count, so the project has a moment to settle. When the
-   run that just ended was **waiting on a question**, the window is **5 minutes**
-   instead, giving you time to answer before the next task starts.
+4. The project must then stay free for the queue's **idle wait** — 30 seconds by
+   default, and the panel's dispatch settings change it per project. Anything
+   that wakes up inside that window — a session you start, a retry on the
+   session that just finished — resets the count, so the project has a moment to
+   settle. When the run that just ended was **waiting on a question**, the window
+   is the queue's **question wait** instead, 5 minutes by default, giving you
+   time to answer before the next task starts.
 5. Take the first pending task that is **still enabled** → create a session →
    send the content. A task switched off keeps its place and is passed over, so
    the enabled task behind it runs instead. The task leaves the queue and is
@@ -97,7 +106,7 @@ For each project, every tick:
    switch turns itself off.
 
 The window applies to the first task too: turning the switch on with a task
-waiting starts it 30 seconds later, not instantly.
+waiting starts it one idle wait later, not instantly.
 
 A task without images is one call: the control API creates the session and sends
 the prompt, which is also what applies the project's default model. A task
@@ -110,12 +119,21 @@ route when it carries images) goes to the session id it recorded, which keeps it
 own model, agent and history.
 
 "Really executing" means `running`, `retrying` or `waiting-permission`.
-`waiting-question` is **not** considered occupied, so an agent that is asking a
-question never blocks the queue — its task is already handed off, and the next
-one simply waits out the longer 5-minute window — while a session
+`waiting-question` is **not** considered occupied by default, so an agent that is
+asking a question never blocks the queue — its task is already handed off, and
+the next one simply waits out the longer question window — while a session
 you started yourself does make the queue wait its turn. A session that sent a
 command to the background also counts as executing: it reports idle while the
 command runs, and the queue waits for that command to finish before it moves on.
+
+The dispatch settings turn those defaults into per-project choices. Under
+**A session holds the queue while it is**, *Waiting on a question* is off and the
+other three are on. Switching *Waiting on a question* on keeps the run active
+until you answer, instead of handing the floor to the next task after the longer
+window; switching *Waiting for permission* or *Running a background command* off
+treats that pause as idle; and switching *Another session is active* off lets the
+queue run even while you work in the same project by hand. `running` and
+`retrying` always hold the queue.
 
 ### Background service
 
@@ -162,8 +180,9 @@ Open the **Queue** panel from the extensions area of the rail:
    sent as images on the session's first prompt. A task needs text; the images
    ride along with it.
 3. Turn on **Enable queue**.
-4. Leave it alone. Once the project has been idle for 30 seconds the first task
-   runs; when it finishes the next one starts.
+4. Leave it alone. Once the project has been idle for the queue's wait (30
+   seconds by default), the first task runs; when it finishes the next one
+   starts.
 
 The header shows the mode and two counters on the right: **pending / done**. Each
 row shows the task content as a three-line summary and has *Run*, *Top*, *Retry*
@@ -182,6 +201,16 @@ Other ways to add a task:
 
 - message menu → **Add to queue** (queues the message text);
 - composer slash command → `/queue <content>`.
+
+**Dispatch settings** sits under the queue switch as a collapsed line showing the
+values in force (`30 s idle · 5 min after a question` by default). Expand it to
+set the idle wait and the question wait in seconds, and to choose what counts as
+busy: *Waiting on a question*, *Waiting for permission*, *Running a background
+command* and *Another session is active*. Every change is written to the queue's
+service in the background: a checkbox applies at once, while a time applies on
+Enter or when the field loses focus, so a half-typed number is never stored. A
+short toast confirms each save, and a failure shows its reason. The settings are
+per project and stay in the queue's `state.json`.
 
 ## Storage and persistence
 

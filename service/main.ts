@@ -17,12 +17,16 @@ import path from 'node:path';
 
 import {
   ACTIVE_GRACE_MS,
+  DEFAULT_QUEUE_SETTINGS,
   DISPATCH_DELAY_MS,
   IMAGE_ID,
   QUESTION_DISPATCH_DELAY_MS,
   clearTasks,
+  type IdlePolicy,
   type QueueEvent,
   type QueueEventType,
+  type QueueSettings,
+  type QueueSettingsPatch,
   type QueueSnapshot,
   countTasks,
   editTask,
@@ -45,7 +49,9 @@ import {
   setDraft,
   setEnabled,
   setTaskEnabled,
+  settingsOf,
   startTask,
+  updateSettings,
   type ActiveRun,
   type ActiveStatus,
   type ProjectQueue,
@@ -208,6 +214,21 @@ const envDelayMs = (name: string, fallback: number): number => {
 
 const DISPATCH_MS = envDelayMs('OPENCHAMBER_QUEUE_DISPATCH_MS', DISPATCH_DELAY_MS);
 const QUESTION_DISPATCH_MS = envDelayMs('OPENCHAMBER_QUEUE_QUESTION_DISPATCH_MS', QUESTION_DISPATCH_DELAY_MS);
+
+/**
+ * The settings a queue runs with until the user customises it. The environment
+ * overrides above stay useful for tests; a queue that carries its own settings
+ * uses those instead.
+ */
+const SERVICE_SETTINGS: QueueSettings = {
+  ...DEFAULT_QUEUE_SETTINGS,
+  dispatchDelayMs: DISPATCH_MS,
+  questionDelayMs: QUESTION_DISPATCH_MS,
+  idle: { ...DEFAULT_QUEUE_SETTINGS.idle },
+};
+
+/** The effective settings of one queue: its own, or this service's defaults. */
+const queueSettings = (queue: ProjectQueue): QueueSettings => settingsOf(queue, SERVICE_SETTINGS);
 
 /** How often a quiet service still looks for images to let go of. */
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -624,10 +645,22 @@ const observe = async (
   directory: string,
   sessions: any[],
   active: ActiveRun | null,
+  settings: QueueSettings,
 ): Promise<Omit<TickObservation, 'idleMs'>> => {
-  const shells = await runningShellSessions(directory);
+  const idle = settings.idle;
+  // The user may not care what the rest of the project is doing: then only the
+  // queue's own run decides when it is free, and no other session is probed.
+  if (!active && !idle.otherSessionsBlock) {
+    return { activeStatus: 'free', projectBusy: false };
+  }
+  // Backgrounded commands only matter when the queue waits for them; skipping
+  // the read saves a request per tick for a policy that ignores them anyway.
+  const shells = idle.backgroundBlocks ? await runningShellSessions(directory) : new Set<string>();
   if (active) {
-    return { activeStatus: await activeStatusFor(active, sessions, directory, shells), projectBusy: false };
+    return {
+      activeStatus: await activeStatusFor(active, sessions, directory, shells, idle),
+      projectBusy: false,
+    };
   }
   const activities = new Map<string, SessionActivity>();
   const busy = sessions.filter((session) => !session?.archivedAt && !isStatusIdle(session));
@@ -636,7 +669,8 @@ const observe = async (
   }));
   return {
     activeStatus: 'free',
-    projectBusy: [...activities.values()].some(isOccupied) || shells.size > 0,
+    projectBusy: [...activities.values()].some((activity) => isOccupied(activity, idle))
+      || (idle.backgroundBlocks && shells.size > 0),
   };
 };
 
@@ -651,6 +685,7 @@ const activeStatusFor = async (
   sessions: any[],
   directory: string,
   shells: Set<string>,
+  idle: IdlePolicy,
 ): Promise<ActiveStatus> => {
   const session = sessions.find((entry) => entry?.id === active.sessionId);
   if (!session) {
@@ -659,11 +694,13 @@ const activeStatusFor = async (
     return Date.now() - active.startedAt < ACTIVE_GRACE_MS ? 'running' : 'free';
   }
   if (session.archivedAt) return 'free';
-  // A question frees the project, so it ends the run — but it is reported on its
-  // own so the caller can give the user the longer window to answer it.
+  // A question frees the project by default, so it ends the run — but it is
+  // reported on its own so the caller can give the user the longer window to
+  // answer it. When the policy says a question holds the queue, it is simply
+  // still running and the next task waits for the answer.
   const activity = await sessionActivity(session, directory, shells);
-  if (activity === 'waiting-question') return 'question';
-  return isOccupied(activity) ? 'running' : 'free';
+  if (activity === 'waiting-question') return idle.questionBlocks ? 'running' : 'question';
+  return isOccupied(activity, idle) ? 'running' : 'free';
 };
 
 // ---------------------------------------------------------------------------
@@ -924,7 +961,7 @@ const nextSettleMs = new Map<string, number>();
 
 /** The settle window a project's next dispatch must wait out. */
 const settleDelayFor = (projectId: string): number =>
-  nextSettleMs.get(projectId) ?? DISPATCH_MS;
+  nextSettleMs.get(projectId) ?? queueSettings(getQueue(state, projectId)).dispatchDelayMs;
 
 /** Forget a project's armed settle window; it no longer has one to honour. */
 const clearSettle = (projectId: string): void => {
@@ -984,7 +1021,7 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
     if (offlineProjects.delete(projectId)) {
       logger.info('[queue] sessions reachable again', { projectId });
     }
-    const observation = await observe(info.directory, sessions, queue.active);
+    const observation = await observe(info.directory, sessions, queue.active, queueSettings(queue));
     const now = Date.now();
     const free = queue.active === null && !observation.projectBusy;
     // Anything but a free project ends the current window, so a run in flight
@@ -1000,7 +1037,7 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
       // A run that ended on a question hands the floor to the user: arm the
       // longer window so the next task does not run over the pending answer. Any
       // other finish clears it and settles for the ordinary window.
-      if (observation.activeStatus === 'question') nextSettleMs.set(projectId, QUESTION_DISPATCH_MS);
+      if (observation.activeStatus === 'question') nextSettleMs.set(projectId, queueSettings(queue).questionDelayMs);
       else clearSettle(projectId);
       finishRun(state, projectId);
       types.push('run.finished');
@@ -1098,7 +1135,7 @@ const evaluateProject = (projectId: string): void => {
 // ---------------------------------------------------------------------------
 
 type Command = {
-  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'set-task-enabled' | 'run-now' | 'set-draft' | 'tick';
+  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'set-task-enabled' | 'set-settings' | 'run-now' | 'set-draft' | 'tick';
   projectId?: string;
   directory?: string;
   name?: string;
@@ -1109,6 +1146,8 @@ type Command = {
   direction?: 'top' | 'up' | 'down';
   /** The queue switch for `set-enabled`, or the new task's own switch for `enqueue`. */
   enabled?: boolean;
+  /** A partial dispatch-settings change for `set-settings`. */
+  settings?: QueueSettingsPatch;
   /** "Append" enqueue: the session the new task should be sent to at dispatch. */
   targetSessionId?: string;
   targetSessionTitle?: string;
@@ -1125,6 +1164,7 @@ const COMMAND_EVENTS: Partial<Record<Command['op'], QueueEventType>> = {
   clear: 'queue.cleared',
   'set-enabled': 'queue.enabled',
   'set-task-enabled': 'task.enabled',
+  'set-settings': 'queue.settings',
 };
 
 const applyCommand = async (command: Command): Promise<boolean> => {
@@ -1165,6 +1205,13 @@ const applyCommand = async (command: Command): Promise<boolean> => {
       return setEnabled(state, projectId, command.enabled === true);
     case 'set-task-enabled':
       return setTaskEnabled(state, projectId, command.taskId ?? '', command.enabled === true);
+    case 'set-settings': {
+      const changed = updateSettings(state, projectId, command.settings ?? {}, SERVICE_SETTINGS);
+      // A window already armed after a question was sized from the old values:
+      // forget it so the next dispatch uses what the user just set.
+      if (changed) clearSettle(projectId);
+      return changed;
+    }
     case 'set-draft':
       return setDraft(state, projectId, { text: command.text ?? '', images: sanitizeImages(command.images) });
     case 'run-now':

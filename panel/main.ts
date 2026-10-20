@@ -42,13 +42,16 @@ import {
   countTasks,
   deriveTitle,
   emptyQueue,
+  type IdlePolicy,
   type ProjectInfo,
   type ProjectQueue,
   type QueueDraft,
   type QueueEvent,
+  type QueueSettingsPatch,
   type QueueSnapshot,
   type QueueTask,
   type TaskImage,
+  settingsOf,
 } from '../src/core.ts';
 import { createTranslator, type Translator } from '../src/i18n.ts';
 
@@ -132,6 +135,10 @@ let editorStrip: HTMLElement | null = null;
 let catchUpAfterBlur = false;
 /** True until the panel has read the queue for the first time. */
 let loading = true;
+/** The dispatch-settings section is open; kept across renders so events do not close it. */
+let settingsOpen = false;
+/** A settings field has focus: hold background re-renders so typing is not disturbed. */
+let settingsFocused = false;
 
 const modeLabel = (value: Mode): string => t(`mode.${value}`);
 
@@ -1063,8 +1070,145 @@ const computeRenderKey = (): string =>
     loading,
     project: project?.id ?? null,
     editingId,
-    queue: editingId !== null ? 'editing' : composerFocused ? 'composing' : queue,
+    queue: editingId !== null ? 'editing' : composerFocused || settingsFocused ? 'composing' : queue,
   });
+
+/** A settle window in the compact form the panel shows: seconds or whole minutes. */
+const formatDelay = (ms: number): string =>
+  ms >= 60000 && ms % 60000 === 0
+    ? t('settings.minutes', { n: ms / 60000 })
+    : t('settings.seconds', { n: Math.round(ms / 1000) });
+
+/** Send one partial settings change; the service merges it into the queue's own. */
+const commitSettings = (patch: QueueSettingsPatch): void => {
+  if (!project || mode === 'unknown') {
+    void host.toast({ kind: 'error', message: t('toast.noService') });
+    return;
+  }
+  // No explicit save button: the change is written to the service as soon as it
+  // is committed, and the toast is the confirmation the panel otherwise lacks.
+  void (async () => {
+    try {
+      await pushCommand({ op: 'set-settings', settings: patch });
+      await host.toast({ kind: 'success', message: t('settings.saved') });
+    } catch (error) {
+      await host.toast({
+        kind: 'error',
+        message: t('settings.saveFailed', {
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      });
+    }
+  })();
+};
+
+/**
+ * A seconds field for one settle window. The value is committed on blur or
+ * Enter, never per keystroke: every commit is a state write and an event, and a
+ * half-typed number is not a setting. A value outside the accepted range is
+ * refused with a message and the stored value stays in force.
+ */
+const mountSecondsField = (
+  host: HTMLElement,
+  field: string,
+  label: string,
+  initialMs: number,
+  onCommit: (ms: number) => void,
+): void => {
+  let current = String(Math.round(initialMs / 1000));
+  const text = mountTextField(host, {
+    label,
+    value: current,
+    helper: t('settings.range'),
+    onChange: (value) => {
+      current = value;
+    },
+  });
+  disposables.push(text);
+  const input = host.lastElementChild?.querySelector('input.oc-sdk-input') ?? null;
+  if (!(input instanceof HTMLInputElement)) return;
+  input.dataset.qxField = field;
+  input.inputMode = 'numeric';
+  input.autocomplete = 'off';
+
+  input.addEventListener('focus', () => {
+    settingsFocused = true;
+    // Seal the render key: a background event must not rebuild this field while
+    // it is being edited.
+    renderKey = computeRenderKey();
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') input.blur();
+    if (event.key === 'Escape') {
+      current = input.value = String(Math.round(initialMs / 1000));
+      input.blur();
+    }
+  });
+  input.addEventListener('blur', () => {
+    settingsFocused = false;
+    const seconds = Number(current.trim());
+    if (!/^\d+$/.test(current.trim()) || seconds < 1 || seconds > 86400) {
+      text.update({ value: current, error: t('settings.invalid') });
+      return;
+    }
+    text.update({ value: current, error: undefined });
+    const ms = Math.round(seconds) * 1000;
+    if (ms !== initialMs) onCommit(ms);
+  });
+};
+
+/**
+ * The per-queue dispatch settings: two settle windows and what counts as a busy
+ * project. Collapsed by default so the rail stays quiet; the summary always
+ * shows the values in force.
+ */
+const renderSettings = (host: HTMLElement): void => {
+  const settings = settingsOf(queue);
+  const details = document.createElement('details') as HTMLDetailsElement;
+  details.className = 'qx-settings';
+  details.open = settingsOpen;
+  details.addEventListener('toggle', () => {
+    settingsOpen = details.open;
+  });
+  host.appendChild(details);
+
+  const summary = details.appendChild(el('summary', 'qx-settings-summary'));
+  summary.appendChild(el('span', 'qx-settings-title', t('settings.title')));
+  summary.appendChild(el('span', 'qx-settings-values', t('settings.summary', {
+    dispatch: formatDelay(settings.dispatchDelayMs),
+    question: formatDelay(settings.questionDelayMs),
+  })));
+
+  const body = details.appendChild(el('div', 'qx-settings-body'));
+  const delays = body.appendChild(el('div', 'qx-settings-delays'));
+  const dispatchHost = delays.appendChild(el('div'));
+  mountSecondsField(dispatchHost, 'settings-dispatch', t('settings.dispatch'), settings.dispatchDelayMs, (ms) =>
+    commitSettings({ dispatchDelayMs: ms }));
+  const questionHost = delays.appendChild(el('div'));
+  mountSecondsField(questionHost, 'settings-question', t('settings.question'), settings.questionDelayMs, (ms) =>
+    commitSettings({ questionDelayMs: ms }));
+
+  body.appendChild(el('div', 'qx-settings-idle', t('settings.idle')));
+  const boxes = body.appendChild(el('div', 'qx-settings-boxes'));
+  const options: Array<{ key: keyof IdlePolicy; label: string }> = [
+    { key: 'questionBlocks', label: t('settings.idleQuestion') },
+    { key: 'permissionBlocks', label: t('settings.idlePermission') },
+    { key: 'backgroundBlocks', label: t('settings.idleBackground') },
+    { key: 'otherSessionsBlock', label: t('settings.idleOther') },
+  ];
+  for (const option of options) {
+    const box = mountCheckbox(boxes, {
+      label: option.label,
+      checked: settings.idle[option.key],
+      onChange: (next) => {
+        const idle: Partial<IdlePolicy> = {};
+        idle[option.key] = next;
+        commitSettings({ idle });
+      },
+    });
+    disposables.push(box);
+  }
+};
 
 const render = (): void => {
   if (!panelMounted) return;
@@ -1127,13 +1271,18 @@ const render = (): void => {
     return;
   }
 
+  const settings = settingsOf(queue);
   const switchHost = controls.appendChild(el('div', 'qx-switch'));
   disposables.push(mountSwitch(switchHost, {
     label: t('switch.label'),
-    description: queue.enabled ? t('switch.on') : t('switch.off'),
+    description: queue.enabled
+      ? t('switch.on', { delay: formatDelay(settings.dispatchDelayMs), question: formatDelay(settings.questionDelayMs) })
+      : t('switch.off'),
     checked: queue.enabled,
     onChange: (next) => void pushCommand({ op: 'set-enabled', enabled: next }),
   }));
+
+  renderSettings(controls);
 
   const composer = controls.appendChild(el('div', 'qx-composer'));
   // The strip sits above the field, the way the app's own composer shows what

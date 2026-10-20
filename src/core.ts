@@ -142,6 +142,12 @@ export type ProjectQueue = {
   completed: number;
   tasks: QueueTask[];
   active: ActiveRun | null;
+  /**
+   * Per-queue dispatch settings. Absent means the queue has never been
+   * customised and the service's own defaults apply — which keeps a state file
+   * written before settings existed behaving exactly as it did.
+   */
+  settings?: QueueSettings;
 };
 
 export type ProjectInfo = {
@@ -169,26 +175,153 @@ export const STATE_VERSION = 1;
 export const ACTIVE_GRACE_MS = 15000;
 
 /**
- * How long a project must stay free before the queue starts the next task.
+ * The default idle wait before the queue starts the next task.
  *
  * The queue lets the project settle first: nothing is dispatched until it has
  * been free for this whole window. Anything that wakes up inside the window —
  * another session, a permission retry, a follow-up on the session that just
  * finished — makes the count start over, so the next task only runs once the
- * project really is quiet.
+ * project really is quiet. A queue with its own settings uses that wait instead.
  */
 export const DISPATCH_DELAY_MS = 30000;
 
 /**
- * The longer settle window used after a run ends on a question.
+ * The default longer settle window used after a run ends on a question.
  *
  * A run whose session stopped to ask the user something is not really done: it
  * waits for an answer the user has not given yet. Rather than start the next
  * task straight away — which would run over the question the previous task is
- * still waiting on — the queue gives the user a few minutes to reply
- * first.
+ * still waiting on — the queue gives the user a few minutes to reply first.
  */
 export const QUESTION_DISPATCH_DELAY_MS = 300000;
+
+/** The shortest settle window a queue may be set to (one second). */
+export const MIN_DELAY_MS = 1000;
+/** The longest settle window a queue may be set to (one day). */
+export const MAX_DELAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * What the queue treats as "busy" for one project.
+ *
+ * `running` and `retrying` always hold the queue: a turn that is executing is
+ * work, whatever the policy. The other statuses are choices, because a user may
+ * consider a session idle while it only waits for them:
+ *
+ * - a question is not occupied by default, so the agent asking does not stall
+ *   the whole project — the user gets the longer question window instead;
+ * - a permission prompt and a backgrounded command are occupied by default,
+ *   because the turn is not finished even though the agent looks idle;
+ * - other sessions hold the project by default, so the queue never starts a
+ *   task while someone is working in the same project by hand.
+ */
+export type IdlePolicy = {
+  /** A session waiting on a question holds the queue until it is answered. */
+  questionBlocks: boolean;
+  /** A session waiting for a permission answer holds the queue. */
+  permissionBlocks: boolean;
+  /** A session whose backgrounded command is still running holds the queue. */
+  backgroundBlocks: boolean;
+  /** Sessions the queue did not start also hold the project. */
+  otherSessionsBlock: boolean;
+};
+
+export const DEFAULT_IDLE_POLICY: IdlePolicy = {
+  questionBlocks: false,
+  permissionBlocks: true,
+  backgroundBlocks: true,
+  otherSessionsBlock: true,
+};
+
+/**
+ * Per-queue dispatch settings. A queue without settings uses the service's own
+ * defaults, which are the values below — so an older state file keeps behaving
+ * exactly as it did before settings existed.
+ */
+export type QueueSettings = {
+  /** How long the project must stay free before the next task starts. */
+  dispatchDelayMs: number;
+  /** The longer window used after a run ended on a question. */
+  questionDelayMs: number;
+  /** What counts as busy while the project is watched. */
+  idle: IdlePolicy;
+};
+
+export const DEFAULT_QUEUE_SETTINGS: QueueSettings = {
+  dispatchDelayMs: DISPATCH_DELAY_MS,
+  questionDelayMs: QUESTION_DISPATCH_DELAY_MS,
+  idle: DEFAULT_IDLE_POLICY,
+};
+
+/** A partial update to one queue's settings, as the panel sends it. */
+export type QueueSettingsPatch = {
+  dispatchDelayMs?: number;
+  questionDelayMs?: number;
+  idle?: Partial<IdlePolicy>;
+};
+
+const sanitizeDelay = (value: unknown, fallback: number): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, Math.round(value)));
+};
+
+const sanitizeFlag = (value: unknown, fallback: boolean): boolean =>
+  typeof value === 'boolean' ? value : fallback;
+
+/** A settings object read from disk or a command, with every field valid. */
+export const sanitizeSettings = (
+  value: unknown,
+  fallback: QueueSettings = DEFAULT_QUEUE_SETTINGS,
+): QueueSettings => {
+  const raw = value && typeof value === 'object' ? value as Partial<QueueSettings> : {};
+  const idle = raw.idle && typeof raw.idle === 'object' ? raw.idle as Partial<IdlePolicy> : {};
+  return {
+    dispatchDelayMs: sanitizeDelay(raw.dispatchDelayMs, fallback.dispatchDelayMs),
+    questionDelayMs: sanitizeDelay(raw.questionDelayMs, fallback.questionDelayMs),
+    idle: {
+      questionBlocks: sanitizeFlag(idle.questionBlocks, fallback.idle.questionBlocks),
+      permissionBlocks: sanitizeFlag(idle.permissionBlocks, fallback.idle.permissionBlocks),
+      backgroundBlocks: sanitizeFlag(idle.backgroundBlocks, fallback.idle.backgroundBlocks),
+      otherSessionsBlock: sanitizeFlag(idle.otherSessionsBlock, fallback.idle.otherSessionsBlock),
+    },
+  };
+};
+
+const sameSettings = (left: QueueSettings, right: QueueSettings): boolean =>
+  left.dispatchDelayMs === right.dispatchDelayMs &&
+  left.questionDelayMs === right.questionDelayMs &&
+  left.idle.questionBlocks === right.idle.questionBlocks &&
+  left.idle.permissionBlocks === right.idle.permissionBlocks &&
+  left.idle.backgroundBlocks === right.idle.backgroundBlocks &&
+  left.idle.otherSessionsBlock === right.idle.otherSessionsBlock;
+
+/** The settings a queue runs with: its own, or the caller's defaults. */
+export const settingsOf = (
+  queue: ProjectQueue,
+  fallback: QueueSettings = DEFAULT_QUEUE_SETTINGS,
+): QueueSettings => queue.settings ?? fallback;
+
+/**
+ * Apply a partial settings change. Returns false when nothing changed, so a
+ * caller can skip a state write and an event. The first change stores a full
+ * settings object, which is what later reads and the panel see.
+ */
+export const updateSettings = (
+  state: QueueState,
+  projectId: string,
+  patch: QueueSettingsPatch,
+  defaults: QueueSettings = DEFAULT_QUEUE_SETTINGS,
+): boolean => {
+  const queue = ensureQueue(state, projectId);
+  const base = settingsOf(queue, defaults);
+  const next = sanitizeSettings({
+    dispatchDelayMs: patch.dispatchDelayMs ?? base.dispatchDelayMs,
+    questionDelayMs: patch.questionDelayMs ?? base.questionDelayMs,
+    idle: { ...base.idle, ...(patch.idle ?? {}) },
+  }, defaults);
+  if (queue.settings ? sameSettings(next, queue.settings) : sameSettings(next, defaults)) return false;
+  queue.settings = next;
+  return true;
+};
 
 export const emptyState = (): QueueState => ({
   version: STATE_VERSION,
@@ -475,22 +608,37 @@ export type SessionActivity =
   | 'background';
 
 /**
- * A session is occupied when it is really executing, which a question is not and
- * a backgrounded task is (the session is idle only because it handed the work to
- * the background; it is not done).
+ * Whether one activity counts as occupied under a queue's idle policy. The
+ * default policy is the queue's historical behaviour: a question is idle, a
+ * permission prompt and a backgrounded command are not, and other sessions
+ * hold the project.
  */
-export const isOccupied = (activity: SessionActivity): boolean =>
-  activity === 'running' ||
-  activity === 'retrying' ||
-  activity === 'waiting-permission' ||
-  activity === 'background';
+export const isOccupied = (
+  activity: SessionActivity,
+  policy: IdlePolicy = DEFAULT_IDLE_POLICY,
+): boolean => {
+  switch (activity) {
+    case 'running':
+    case 'retrying':
+      return true;
+    case 'waiting-permission':
+      return policy.permissionBlocks;
+    case 'waiting-question':
+      return policy.questionBlocks;
+    case 'background':
+      return policy.backgroundBlocks;
+    default:
+      return false;
+  }
+};
 
 /**
  * Status of the session this queue itself dispatched: `running` while it really
  * executes, `question` when it only stopped to ask the user something, and
- * `free` as soon as it is idle or gone. A question neither occupies the project
- * nor finishes the task, so the caller treats it as a finish — but one that arms
- * the longer settle window.
+ * `free` as soon as it is idle or gone. By default a question neither occupies
+ * the project nor finishes the task, so the caller treats it as a finish — but
+ * one that arms the longer settle window. Under an idle policy that makes a
+ * question busy, it stays `running` instead.
  */
 export type ActiveStatus = 'running' | 'free' | 'question';
 
@@ -580,6 +728,9 @@ export const repairQueue = (queue: ProjectQueue): ProjectQueue => {
     });
   queue.completed = typeof queue.completed === 'number' && Number.isFinite(queue.completed) ? queue.completed : 0;
   if (queue.active && typeof queue.active.sessionId !== 'string') queue.active = null;
+  // A queue customised before a setting existed gains the default for it; a
+  // queue that never had settings stays on the service's own defaults.
+  if (queue.settings !== undefined) queue.settings = sanitizeSettings(queue.settings);
   return queue;
 };
 
@@ -646,6 +797,7 @@ export type QueueEventType =
   | 'task.retried'
   /** One task switched on or off for the scheduler — not the queue's own switch. */
   | 'task.enabled'
+  | 'queue.settings'
   | 'run.started'
   | 'run.finished'
   | 'task.failed';

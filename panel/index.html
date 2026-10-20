@@ -38,6 +38,68 @@
       .qx-switch {
         flex: none;
       }
+      /* Per-queue dispatch settings: a collapsed disclosure by default, so the
+         rail stays quiet, with the values in force on its summary line. */
+      .qx-settings {
+        flex: none;
+        border: 1px solid var(--oc-border);
+        border-radius: var(--oc-radius, 8px);
+      }
+      .qx-settings-summary {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 6px 8px;
+        cursor: pointer;
+        list-style: none;
+        font-size: 12px;
+        user-select: none;
+      }
+      .qx-settings-summary::-webkit-details-marker {
+        display: none;
+      }
+      .qx-settings-summary::before {
+        content: '▸';
+        flex: none;
+        color: var(--oc-muted);
+        transition: transform 120ms ease-out;
+      }
+      .qx-settings[open] .qx-settings-summary::before {
+        transform: rotate(90deg);
+      }
+      .qx-settings-title {
+        font-weight: 500;
+      }
+      .qx-settings-values {
+        margin-left: auto;
+        color: var(--oc-muted);
+        font-size: 11px;
+        text-align: right;
+      }
+      .qx-settings-body {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 0 8px 8px;
+      }
+      .qx-settings-delays {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .qx-settings-delays > div {
+        flex: 1 1 120px;
+        min-width: 0;
+      }
+      .qx-settings-idle {
+        color: var(--oc-muted);
+        font-size: 0.75rem;
+      }
+      .qx-settings-boxes {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
       .qx-header {
         display: flex;
         flex-direction: column;
