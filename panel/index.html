@@ -69,6 +69,9 @@
       }
       .qx-settings-title {
         font-weight: 500;
+        /* The title is a phrase, not a label to hyphenate: keep it whole and let
+           the values drop to their own line instead. */
+        white-space: nowrap;
       }
       .qx-settings-values {
         margin-left: auto;
@@ -227,6 +230,12 @@
         align-items: center;
         gap: 8px;
         padding: 8px 10px;
+        /* The action bar never shrinks, so on a narrow panel the text would be
+           squeezed to a couple of characters per line. Let the row wrap instead:
+           the text keeps the whole first line and the actions move below it,
+           still against the right edge. */
+        flex-wrap: wrap;
+        row-gap: 6px;
       }
       .qx-row + .qx-row,
       .qx-row + .qx-edit,
@@ -246,7 +255,9 @@
         color: var(--oc-muted);
       }
       .qx-row-body {
-        flex: 1;
+        /* Enough room to read a line; below that the actions wrap instead of the
+           text collapsing. */
+        flex: 1 1 150px;
         min-width: 0;
       }
       .qx-row-text {
@@ -273,6 +284,11 @@
         gap: 4px;
         flex: none;
         align-items: center;
+        /* Wrapped onto its own line, the bar still lines up with the right edge
+           of the row. */
+        margin-left: auto;
+        flex-wrap: wrap;
+        justify-content: flex-end;
       }
       /* A compact checkbox beside the small action buttons (per task) and on the
          composer caption line: the SDK default is a full-width block with a
@@ -351,6 +367,47 @@
         border-radius: 9999px;
         background: var(--oc-primary);
         animation: qx-busy-slide 900ms ease-in-out infinite;
+      }
+      /* A narrow panel (a phone, or the rail dragged thin) needs its own reading
+         order. Each threshold is where the thing it changes stops fitting on one
+         line, measured with the labels as shipped. The panel is an iframe, so
+         the viewport width is the panel width. */
+      /* Four composer buttons need about 430px of content; below that, pair them
+         up so the wrapped rows line up instead of leaving a ragged gap. */
+      @media (max-width: 460px) {
+        .qx-composer-actions {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+        }
+        .qx-composer-actions > button {
+          width: 100%;
+          min-width: 0;
+        }
+      }
+      /* The title row needs about 360px of content for the badges to sit at its
+         right; below that they wrap, and floating right on a line of their own
+         leaves a gap, so let them flow after the project name. */
+      @media (max-width: 400px) {
+        .qx-counts {
+          margin-left: 0;
+          justify-content: flex-start;
+        }
+      }
+      /* The settings summary needs about 300px for its values beside the title;
+         below that the values go under it, left-aligned with the title. */
+      @media (max-width: 350px) {
+        .qx-settings-summary {
+          flex-wrap: wrap;
+          row-gap: 2px;
+        }
+        .qx-settings-title {
+          flex: 0 0 auto;
+        }
+        .qx-settings-values {
+          flex: 1 1 100%;
+          margin-left: 14px;
+          text-align: left;
+        }
       }
       @keyframes qx-busy-slide {
         from {
