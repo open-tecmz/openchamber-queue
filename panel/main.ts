@@ -84,6 +84,23 @@ let mode: Mode = 'unknown';
 let project: ProjectInfo | null = null;
 let directory: string | null = null;
 let queue: ProjectQueue = emptyQueue();
+/**
+ * The sequence `queue` was read or pushed at. A read answers with a snapshot of
+ * one moment, and the event stream may have moved past it while it was in
+ * flight, so an answer older than what is on screen is dropped instead of
+ * painted over the newer state.
+ */
+let queueSeq = 0;
+/** The last queue seen for each project, so switching back paints before the read answers. */
+const knownQueues = new Map<string, ProjectQueue>();
+/**
+ * Which project the panel is showing, as a number that moves with every switch.
+ * A read that started under another value answers for a project the user has
+ * already left, and must not write anything: that is how a switch used to end up
+ * showing the previous project, or the previous project's tasks under the new
+ * name, whenever two switches overlapped.
+ */
+let projectToken = 0;
 let renderKey = '';
 let panelMounted = false;
 let backgroundMounted = false;
@@ -659,18 +676,21 @@ document.addEventListener('drop', (event) => {
 // ---------------------------------------------------------------------------
 
 const pushCommand = async (command: Record<string, unknown>): Promise<void> => {
-  if (!project || mode === 'unknown') return;
+  const current = project;
+  if (!current || mode === 'unknown') return;
   beginPending();
   try {
     // A command answers as soon as it applied its change, before the dispatch it
-    // may have enabled: an event may already be ahead of that answer, so the
-    // cursor only ever moves forward.
-    const result = await backend.command(project.id, command);
-    if (result.queue && result.seq >= seq) {
+    // may have enabled: an event may already be ahead of that answer, so what it
+    // carries is only taken when it is the newest thing for this project.
+    const result = await backend.command(current.id, command);
+    if (project === current && result.queue && result.seq >= queueSeq) {
       queue = result.queue;
-      seq = result.seq;
+      queueSeq = result.seq;
+      seq = Math.max(seq, result.seq);
+      rememberQueue();
     }
-    await publish();
+    publish();
   } finally {
     endPending();
   }
@@ -735,21 +755,108 @@ let watchTimer: number | null = null;
 /** Cursor into the service's event log: the last sequence number applied. */
 let seq = 0;
 
-/** Show whatever the model currently holds: badge plus panel. */
-const publish = async (): Promise<void> => {
-  await host.setBadge(countTasks(queue).pending);
+// ---------------------------------------------------------------------------
+// Project list: the host pushes it, so a switch costs a lookup, not a request
+// ---------------------------------------------------------------------------
+
+/**
+ * The host's projects as it last pushed them, keyed by directory.
+ *
+ * Switching projects used to ask the host for this list every time, which put a
+ * second round trip in front of the read of the new project's queue — and, when
+ * the host answered late or not at all, resolved the directory to a made-up id
+ * (`dir:<path>`) whose queue was empty, so the panel looked as if it had not
+ * switched at all. The host already pushes the list on subscribe and whenever it
+ * changes, so the answer is here before the user switches.
+ */
+let projectsByDirectory = new Map<string, ProjectInfo>();
+
+/** Replace the cached list; one snapshot is the whole truth about it. */
+const rememberProjects = (projects: readonly { id: string; name: string; directory: string }[]): void => {
+  const next = new Map<string, ProjectInfo>();
+  for (const entry of projects) {
+    next.set(entry.directory, { id: entry.id, directory: entry.directory, name: entry.name });
+  }
+  projectsByDirectory = next;
+};
+
+/** The cached project for a directory, if the host has named it. */
+const cachedProject = (dir: string): ProjectInfo | null => projectsByDirectory.get(dir) ?? null;
+
+/** Read the host's project list once, for a directory the push has not named. */
+const readProjects = async (): Promise<void> => {
+  try {
+    const snapshot = await host.listProjects();
+    if (snapshot.state === 'ready') rememberProjects(snapshot.projects);
+  } catch {
+    // Keep the last list; the caller falls back to the directory itself.
+  }
+};
+
+/** Follow the host's project list so a switch is answered from memory. */
+const followProjects = async (): Promise<void> => {
+  try {
+    await host.onProjects((snapshot) => {
+      if (snapshot.state === 'ready') rememberProjects(snapshot.projects);
+    });
+  } catch {
+    // An older host, or a refused subscription: `resolveTarget` reads the list.
+  }
+};
+
+/** The last path segment, shown while a directory is still being resolved. */
+const folderName = (dir: string): string => dir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || dir;
+
+// ---------------------------------------------------------------------------
+// Painting state
+// ---------------------------------------------------------------------------
+
+/** The count last sent to the host, so an unchanged badge costs nothing. */
+let badgeValue: number | null = null;
+
+/**
+ * Show whatever the model currently holds: the panel first, then the rail badge.
+ * The badge is a host round trip, and waiting for it before painting made every
+ * update — a project switch included — arrive a message late for no reason.
+ */
+const publish = (): void => {
   render();
+  const next = countTasks(queue).pending;
+  if (next === badgeValue) return;
+  badgeValue = next;
+  void host.setBadge(next).catch(() => {
+    // Leave the value unstored so the next publish tries again.
+    badgeValue = null;
+  });
+};
+
+/** Keep the queue the screen shows, so a switch back has something to paint. */
+const rememberQueue = (): void => {
+  if (project) knownQueues.set(project.id, queue);
 };
 
 const refresh = async (): Promise<void> => {
-  if (!project) {
+  const token = projectToken;
+  const current = project;
+  if (!current) {
+    loading = false;
     render();
     return;
   }
   try {
-    const loaded = await backend.load(project.id);
-    queue = loaded.queue;
-    seq = loaded.seq;
+    const loaded = await backend.load(current.id);
+    // The user may have switched while this read was in flight: its answer is
+    // about a project that is no longer on screen.
+    if (token !== projectToken || project !== current) return;
+    loading = false;
+    // A read is a snapshot of one moment; the event stream may have moved past
+    // it meanwhile, and what it delivered is the newer state.
+    if (loaded.seq >= queueSeq) {
+      queue = loaded.queue;
+      queueSeq = loaded.seq;
+      seq = Math.max(seq, loaded.seq);
+      rememberQueue();
+    }
     if (composerProject === project.id) {
       // This project's draft is already loaded. Keep what the user has typed
       // even if it is still unsaved (the service may only just have come up),
@@ -767,11 +874,13 @@ const refresh = async (): Promise<void> => {
       for (const image of composerImages) void loadThumb(image, owner);
     }
   } catch (error) {
+    if (token !== projectToken) return;
+    loading = false;
     // The service may have gone away; switch to the connecting state and let
     // the slow retry bring it back. Keep the last known queue on screen.
     if (isNoService(error)) await applyMode();
   }
-  await publish();
+  publish();
 };
 
 /**
@@ -783,14 +892,26 @@ const refresh = async (): Promise<void> => {
  */
 const applyEvents = async (batch: EventsBatch): Promise<void> => {
   if (batch.reset) {
+    // The cursor points into a log this service no longer has: start over, so
+    // the read that follows is the newest thing known about the open project.
+    seq = 0;
+    queueSeq = 0;
     await refresh();
     return;
   }
+  let changed = false;
   for (const event of batch.events) {
-    if (project && event.projectId === project.id) queue = event.queue;
+    if (project && event.projectId === project.id && event.seq >= queueSeq) {
+      queue = event.queue;
+      queueSeq = event.seq;
+      changed = true;
+    }
   }
-  seq = batch.seq;
-  if (batch.events.length > 0) await publish();
+  seq = Math.max(seq, batch.seq);
+  if (changed) {
+    rememberQueue();
+    publish();
+  }
 };
 
 /** One reader per panel: a second loop would only park a second connection. */
@@ -900,7 +1021,9 @@ const syncDrivers = async (): Promise<void> => {
  */
 const applyMode = async (): Promise<void> => {
   await detectMode();
-  if (mode === 'backend' && project) await registerProject(project);
+  // A service that just answered health can still refuse this; the project is
+  // registered again the next time the mode upgrades or the user switches.
+  if (mode === 'backend' && project) await registerProject(project).catch(() => undefined);
   await syncDrivers();
 };
 
@@ -1235,8 +1358,15 @@ const render = (): void => {
   editorStrip = null;
 
   // The first read can take a moment: show that something is happening instead
-  // of an empty rail.
+  // of an empty rail. A switch paints the project it is opening at once, so the
+  // name on screen is already the new one while its queue is on the way.
   if (loading) {
+    if (project) {
+      const head = root.appendChild(el('div', 'qx-controls'));
+      const row = head.appendChild(el('div', 'qx-title-row'));
+      row.appendChild(el('span', 'qx-title', t('title')));
+      row.appendChild(el('span', 'qx-project', project.name || project.directory));
+    }
     const loadingHost = root.appendChild(el('div', 'qx-loading'));
     disposables.push(mountSpinner(loadingHost, { label: t('loading') }));
     return;
@@ -1597,15 +1727,22 @@ const renderEditor = (task: QueueTask): HTMLElement => {
 
 type Target = { projectId: string; directory: string; name: string };
 
+/**
+ * The project the open directory belongs to.
+ *
+ * The host's pushed list answers this from memory, so a switch costs a lookup
+ * instead of a request — and the id it gives is the same one on every switch, so
+ * a directory never ends up with two queues. A directory the host has not named
+ * (a worktree, a folder outside any project) is read once more, and the directory
+ * itself stands in when even that has no match.
+ */
 const resolveTarget = async (dir: string | null): Promise<Target | null> => {
   if (!dir) return null;
-  try {
-    const snapshot = await host.listProjects();
-    const match = snapshot.projects.find((entry) => entry.directory === dir);
-    if (match) return { projectId: match.id, directory: match.directory, name: match.name };
-  } catch {
-    // fall through to a synthetic id
-  }
+  const known = cachedProject(dir);
+  if (known) return { projectId: known.id, directory: known.directory, name: known.name };
+  await readProjects();
+  const found = cachedProject(dir);
+  if (found) return { projectId: found.id, directory: found.directory, name: found.name };
   return { projectId: `dir:${dir}`, directory: dir, name: dir };
 };
 
@@ -1655,23 +1792,96 @@ const mountBackground = (): void => {
 };
 
 // ---------------------------------------------------------------------------
-// Boot
+// Boot and project switching
 // ---------------------------------------------------------------------------
 
-const preparePanel = async (): Promise<void> => {
-  try {
-    if (directory) {
-      const target = await resolveTarget(directory);
-      project = target ? { id: target.projectId, directory: target.directory, name: target.name } : null;
-    }
-    await detectMode();
-    if (project) await registerProject(project);
-    await syncDrivers();
-  } finally {
-    // Whatever the outcome, stop showing the loading state.
+/**
+ * Show `next` as the open project without waiting for anything: its name, and
+ * the queue it had when the panel last saw it. Painting before the read is what
+ * keeps a switch from looking as if it did not happen — otherwise the previous
+ * project's tasks and name stay on screen for however long the read takes.
+ */
+const adoptDirectory = (next: string | null): void => {
+  if (!next) {
+    project = null;
+    queue = emptyQueue();
+    queueSeq = 0;
     loading = false;
+    renderKey = '';
     render();
+    return;
   }
+  const known = cachedProject(next);
+  // A directory the host has not named yet keeps its folder name until the
+  // resolve answers; nothing can be clicked while it says it is loading.
+  project = known
+    ? { id: known.id, directory: known.directory, name: known.name }
+    : { id: '', directory: next, name: folderName(next) };
+  const cached = project.id ? knownQueues.get(project.id) ?? null : null;
+  queue = cached ?? emptyQueue();
+  queueSeq = 0;
+  loading = cached === null;
+  renderKey = '';
+  render();
+};
+
+/**
+ * Open the project at `dir` under the given switch token. A later switch moves
+ * the token, and every answer that arrives afterwards is dropped rather than
+ * painted: two overlapping switches used to leave whichever read finished last
+ * on screen, which was sometimes the project the user had already left.
+ */
+const switchProject = async (dir: string | null, token: number): Promise<void> => {
+  const previous = project;
+  const target = await resolveTarget(dir);
+  if (token !== projectToken) return;
+  project = target ? { id: target.projectId, directory: target.directory, name: target.name } : null;
+  const cached = project ? knownQueues.get(project.id) ?? null : null;
+  if (!project) {
+    queue = emptyQueue();
+    queueSeq = 0;
+    loading = false;
+  } else if (cached) {
+    // Shown at once, then corrected by the read below.
+    queue = cached;
+    queueSeq = 0;
+    loading = false;
+  } else if (project.id !== previous?.id) {
+    // The id changed under a queue painted for the old one: that queue is not
+    // this project's, so go back to showing that its state is on the way.
+    queue = emptyQueue();
+    queueSeq = 0;
+    loading = true;
+  }
+  // The name may have been the folder name a moment ago; paint it now even when
+  // the id is unchanged.
+  renderKey = '';
+  publish();
+  if (project) {
+    // Registering and reading are independent: one round trip, not two.
+    await Promise.allSettled([registerProject(project), refresh()]);
+  }
+  if (token !== projectToken) return;
+  await syncDrivers();
+};
+
+const preparePanel = async (): Promise<void> => {
+  const token = projectToken;
+  let target: Target | null = null;
+  try {
+    if (directory) target = await resolveTarget(directory);
+    if (token !== projectToken) return;
+    project = target ? { id: target.projectId, directory: target.directory, name: target.name } : null;
+    await detectMode();
+    // A failed registration is not worth stopping for: the read below still
+    // shows what this project has, and the next upgrade to `backend` retries it.
+    if (project) await registerProject(project).catch(() => undefined);
+    await syncDrivers();
+  } catch {
+    // Nothing here can be reported better than the read below does.
+  }
+  if (token !== projectToken) return;
+  // The read ends the loading state, whether it answers or fails.
   await refresh();
 };
 
@@ -1697,9 +1907,11 @@ host.onReady((ctx) => {
   });
   mountBusyBar();
   directory = ctx.directory;
+  // The host pushes its project list, so a switch is answered from memory.
+  void followProjects();
   // Paint the loading state before the first read answers.
   render();
-  void preparePanel();
+  void preparePanel().catch(() => undefined);
 });
 
 host.onDirectory((next) => {
@@ -1713,16 +1925,15 @@ host.onDirectory((next) => {
   flushDraftSave();
   resetDraft();
   directory = next;
-  void (async () => {
-    editingId = null;
-    draftText = '';
-    const target = next ? await resolveTarget(next) : null;
-    project = target ? { id: target.projectId, directory: target.directory, name: target.name } : null;
-    if (project) await registerProject(project);
-    // The stream belongs to the service and carries every project, so switching
-    // projects keeps the reader and the cursor: only the new project's state is
-    // read.
-    await refresh();
-    await syncDrivers();
-  })();
+  editingId = null;
+  draftText = '';
+  editingImages = [];
+  // Everything still in flight belongs to the project being left.
+  projectToken += 1;
+  const token = projectToken;
+  adoptDirectory(next);
+  // The stream belongs to the service and carries every project, so switching
+  // projects keeps the reader and the cursor: only the new project's state is
+  // read.
+  void switchProject(next, token).catch(() => undefined);
 });

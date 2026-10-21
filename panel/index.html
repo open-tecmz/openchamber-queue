@@ -156,14 +156,15 @@
         justify-content: flex-start;
       }
       /* The host repaints the kit's buttons for the app: an inset ring plus a
-         1px lift shadow under the button. At this size that lift reads as a
-         second line under the button, so the composer's buttons keep the edge
-         as a real border and drop the shadow. Two classes on the button outrank
-         the kit's one, whichever style sheet the host appends last. */
-      .qx-composer-actions > button.oc-sdk-btn {
+         1px lift shadow under the button. At these sizes that lift reads as a
+         second line below the button, so every button in the panel keeps the
+         edge as a real border and drops the shadow. Carrying the kit's root
+         class as well outranks the host's own button rules, whichever style
+         sheet it appends last. */
+      button.oc-sdk.oc-sdk-btn {
         box-shadow: none;
       }
-      .qx-composer-actions > button.oc-sdk-btn[data-variant="outline"] {
+      button.oc-sdk.oc-sdk-btn[data-variant="outline"] {
         border-color: var(--oc-sdk-edge, var(--oc-border));
       }
       /* What is attached to the composer or to the task being edited. */
