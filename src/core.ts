@@ -134,6 +134,12 @@ export type QueueDraft = {
 export type ActiveRun = {
   sessionId: string;
   startedAt: number;
+  /**
+   * Id of the task that was dispatched into this session. The task itself is
+   * removed from the queue at dispatch, so this is the only record left of which
+   * task is running — for external tools and panels that need to tell.
+   */
+  taskId?: string;
 };
 
 export type ProjectQueue = {
@@ -569,7 +575,7 @@ export const startTask = (
   if (!queue || !task) return;
   queue.tasks = queue.tasks.filter((entry) => entry.id !== taskId);
   queue.completed += 1;
-  queue.active = { sessionId, startedAt: now };
+  queue.active = { sessionId, startedAt: now, taskId };
   // Deliberately not normalized here: an empty queue stays enabled while the
   // dispatched session runs, and turns itself off in finishRun.
 };
@@ -728,6 +734,11 @@ export const repairQueue = (queue: ProjectQueue): ProjectQueue => {
     });
   queue.completed = typeof queue.completed === 'number' && Number.isFinite(queue.completed) ? queue.completed : 0;
   if (queue.active && typeof queue.active.sessionId !== 'string') queue.active = null;
+  // A run written before the task id was recorded keeps working without it; a
+  // task id of the wrong shape is dropped on its own, leaving the run in place.
+  if (queue.active && queue.active.taskId !== undefined && typeof queue.active.taskId !== 'string') {
+    delete queue.active.taskId;
+  }
   // A queue customised before a setting existed gains the default for it; a
   // queue that never had settings stays on the service's own defaults.
   if (queue.settings !== undefined) queue.settings = sanitizeSettings(queue.settings);
