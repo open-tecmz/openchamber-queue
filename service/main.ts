@@ -21,6 +21,7 @@ import {
   DISPATCH_DELAY_MS,
   IMAGE_ID,
   QUESTION_DISPATCH_DELAY_MS,
+  clearPause,
   clearTasks,
   type IdlePolicy,
   type QueueEvent,
@@ -39,6 +40,8 @@ import {
   isOccupied,
   markFailed,
   moveTask,
+  noteFailure,
+  noteHealthyRun,
   planTick,
   referencedImageIds,
   registerProject,
@@ -862,15 +865,148 @@ const appendToSession = async (
   return { sessionId };
 };
 
-const dispatch = async (projectId: string, directory: string, task: QueueTask): Promise<QueueEventType> => {
+/**
+ * One turn's end, as OpenCode records it in the session's last `idle` message:
+ * `succeeded`, `failed` (with the provider error) or `interrupted` (a manual
+ * stop or an OpenCode restart). `unknown` means the record could not be read.
+ */
+type TurnOutcome = {
+  outcome: 'succeeded' | 'failed' | 'interrupted' | 'unknown';
+  error?: {
+    type?: string;
+    /** v1 used `name` for the error class. */
+    name?: string;
+    message?: string;
+    /** v1 nested the provider message here. */
+    data?: { message?: string };
+  };
+};
+
+/**
+ * How far before `startedAt` an idle record may still belong to a new session's
+ * run. A failed prompt can finish while the dispatch call is still returning, so
+ * the record may predate the moment the run was recorded by a moment. An append
+ * task uses its own message baseline instead.
+ */
+const TURN_IDLE_SLACK_MS = 10_000;
+
+/** `provider.transport: Timed out...`, the line the panel and the log keep. */
+const describeTurnError = (error: TurnOutcome['error']): string => {
+  const rawType = typeof error?.type === 'string' ? error.type : error?.name;
+  const rawMessage = typeof error?.message === 'string' ? error.message : error?.data?.message;
+  const type = typeof rawType === 'string' ? rawType.trim() : '';
+  const message = typeof rawMessage === 'string' ? rawMessage.trim() : '';
+  if (type && message) return `${type}: ${message}`.slice(0, 400);
+  return (message || type || 'The session ended with an error').slice(0, 400);
+};
+
+/**
+ * Creation time of the newest message in a session, used as the baseline for an
+ * append task. A new session needs none. A failed read leaves it undefined and
+ * the outcome reader falls back to its small time window.
+ */
+const latestMessageAt = async (sessionId: string, directory: string): Promise<number | undefined> => {
+  const result = await serverGet(
+    `/api/session/${encodeURIComponent(sessionId)}/message?limit=1&order=desc`,
+    directory,
+  );
+  if (!result.ok) return undefined;
+  const records = Array.isArray(result.body?.data) ? result.body.data : [];
+  const at = Number(records[0]?.time?.created ?? records[0]?.info?.time?.created);
+  return Number.isFinite(at) ? at : undefined;
+};
+
+/**
+ * Read how the turn that started at `startedAt` ended.
+ *
+ * OpenCode v2 writes one `idle` record at the end of every turn with an
+ * `outcome` and, for a failure, the provider error. The record is the signal
+ * the breaker uses: a normal fast answer is `succeeded`, a provider/API failure
+ * is `failed`, and a stop by the user (or an OpenCode restart) is `interrupted`.
+ * The queue reads a small newest-first page, then takes the oldest record that
+ * is recent enough to belong to this run — a follow-up turn, if one happened,
+ * must not hide the end of ours.
+ */
+const lastTurnOutcome = async (
+  sessionId: string,
+  directory: string,
+  startedAt: number,
+  baselineAt?: number,
+): Promise<TurnOutcome> => {
+  const result = await serverGet(
+    `/api/session/${encodeURIComponent(sessionId)}/message?limit=5&order=desc`,
+    directory,
+  );
+  if (!result.ok) {
+    logger.warn('[queue] could not read the session outcome', { sessionId, reason: result.error });
+    return { outcome: 'unknown' };
+  }
+  const records = Array.isArray(result.body?.data) ? result.body.data : [];
+  // An append task knows where the previous turn ended, so only a strictly
+  // newer record can be its own. A new session has no history worth guarding
+  // against, hence the small slack for a turn that failed before the dispatch
+  // call returned.
+  const recent = records
+    .map((record: any) => ({
+      // v2 records are the message itself (`type`); v1 records wrap it in
+      // `info`. Supporting both keeps an older OpenCode usable.
+      type: record?.type ?? record?.info?.role,
+      at: Number(record?.time?.created ?? record?.info?.time?.created),
+      outcome: record?.outcome,
+      error: record?.error ?? record?.info?.error,
+      finish: record?.finish ?? record?.info?.finish,
+    }))
+    .filter((record: any) => Number.isFinite(record.at)
+      && (baselineAt !== undefined ? record.at > baselineAt : record.at >= startedAt - TURN_IDLE_SLACK_MS));
+
+  const idle = recent
+    .filter((record: any) => record.type === 'idle' && typeof record.outcome === 'string')
+    .sort((left: any, right: any) => left.at - right.at)[0];
+  if (idle) {
+    if (idle.outcome === 'succeeded' || idle.outcome === 'failed' || idle.outcome === 'interrupted') {
+      return { outcome: idle.outcome, error: idle.error };
+    }
+    return { outcome: 'unknown' };
+  }
+
+  // Older OpenCode builds may not write the idle record yet. The assistant
+  // message carries the same finish/error fields, so use it as a fallback.
+  const assistant = recent
+    .filter((record: any) => record.type === 'assistant')
+    .sort((left: any, right: any) => right.at - left.at)[0];
+  if (assistant) {
+    if (assistant.finish === 'error') {
+      const type = typeof assistant.error?.type === 'string'
+        ? assistant.error.type
+        : typeof assistant.error?.name === 'string' ? assistant.error.name : '';
+      const aborted = type === 'aborted' || type === 'MessageAbortedError';
+      return { outcome: aborted ? 'interrupted' : 'failed', error: assistant.error };
+    }
+    if (typeof assistant.finish === 'string') return { outcome: 'succeeded' };
+  }
+  return { outcome: 'unknown' };
+};
+
+/**
+ * Hand one task to a session. The event types it returns are emitted by the
+ * caller: a dispatch that fails may also pause the queue, and a failure pause
+ * has to reach the panel together with the task's own failure.
+ */
+const dispatch = async (projectId: string, directory: string, task: QueueTask): Promise<QueueEventType[]> => {
   // An append task names the session it belongs to; everything else creates a
   // fresh session. Either way the dispatched session is remembered as the run.
   const prompt: Prompt = { text: task.text, images: task.images };
+  // An append task runs in a session that already has history. Remember where
+  // that history ended, so the outcome reader cannot mistake the previous
+  // turn's idle record for this one.
+  const baselineAt = task.target
+    ? await latestMessageAt(task.target.sessionId, directory)
+    : undefined;
   const started = task.target
     ? await appendToSession(directory, task.target.sessionId, prompt)
     : await startSessionFor(projectId, directory, prompt);
   if ('sessionId' in started) {
-    startTask(state, projectId, task.id, started.sessionId);
+    startTask(state, projectId, task.id, started.sessionId, { baselineAt });
     logger.info('[queue] dispatched task', {
       projectId,
       taskId: task.id,
@@ -878,11 +1014,23 @@ const dispatch = async (projectId: string, directory: string, task: QueueTask): 
       images: task.images.length,
       appended: Boolean(task.target),
     });
-    return 'run.started';
+    return ['run.started'];
   }
   markFailed(state, projectId, task.id, started.error);
+  const pause = noteFailure(
+    state,
+    projectId,
+    'dispatch',
+    started.error,
+    queueSettings(getQueue(state, projectId)),
+  );
   logger.error('[queue] dispatch failed', { projectId, taskId: task.id, reason: started.error });
-  return 'task.failed';
+  if (!pause) return ['task.failed'];
+  // Repeated dispatch failures mean the host or the model is refusing every
+  // attempt. Switch the queue off before it moves on to the next task.
+  setEnabled(state, projectId, false);
+  logger.warn('[queue] paused after failed dispatches', { projectId, detail: pause.detail });
+  return ['task.failed', 'queue.paused'];
 };
 
 /**
@@ -895,9 +1043,10 @@ const runTask = async (projectId: string, taskId: string): Promise<void> => {
   const info = state.projects[projectId];
   const task = getQueue(state, projectId).tasks.find((entry) => entry.id === taskId);
   if (!info || !task) return;
-  const type = await dispatch(projectId, info.directory, task);
+  const types = await dispatch(projectId, info.directory, task);
+  if (types.includes('queue.paused')) resetIdleClock(projectId);
   await persist();
-  emit(projectId, type);
+  for (const type of types) emit(projectId, type);
 };
 
 /** Create a session for this composer right away, bypassing the queue. */
@@ -933,6 +1082,16 @@ const cancelDispatchCheck = (projectId: string): void => {
   const timer = dispatchChecks.get(projectId);
   if (timer) clearTimeout(timer);
   dispatchChecks.delete(projectId);
+};
+
+/**
+ * Forget a project's idle clock and any armed re-check. A pause takes over
+ * scheduling, and the window after it lifts must start fresh: the project may
+ * have come and gone while nobody was watching it.
+ */
+const resetIdleClock = (projectId: string): void => {
+  freeSince.delete(projectId);
+  cancelDispatchCheck(projectId);
 };
 
 /**
@@ -994,6 +1153,11 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
   if (!info) return [];
   const types: QueueEventType[] = [];
 
+  // A self-pause blocks new dispatches, but a run that was started by hand
+  // after the pause still has to be watched to completion.
+  const pausedQueue = getQueue(state, projectId);
+  if (!pausedQueue.active && pausedQueue.guard?.pause) return types;
+
   if (!queueHasWork(getQueue(state, projectId))) {
     // Nothing queued: the settle window only starts once there is work to run.
     freeSince.delete(projectId);
@@ -1034,12 +1198,50 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
     });
 
     if (decision.kind === 'finish') {
-      // A run that ended on a question hands the floor to the user: arm the
-      // longer window so the next task does not run over the pending answer. Any
-      // other finish clears it and settles for the ordinary window.
-      if (observation.activeStatus === 'question') nextSettleMs.set(projectId, queueSettings(queue).questionDelayMs);
-      else clearSettle(projectId);
-      finishRun(state, projectId);
+      const settingsNow = queueSettings(queue);
+      if (observation.activeStatus === 'question') {
+        // A turn that ended on a question hands the floor to the user: arm the
+        // longer window so the next task does not run over the pending answer.
+        nextSettleMs.set(projectId, settingsNow.questionDelayMs);
+        noteHealthyRun(state, projectId);
+        finishRun(state, projectId);
+        types.push('run.finished');
+        continue;
+      }
+      // Ask OpenCode how the turn itself ended. `failed` is a real request
+      // failure (provider down, quota, auth), which the old duration guess could
+      // not tell apart from a task that genuinely finished quickly.
+      const run = queue.active;
+      const turn = run
+        ? await lastTurnOutcome(run.sessionId, info.directory, run.startedAt, run.baselineAt)
+        : { outcome: 'unknown' as const };
+      // Reading the outcome awaits the host; a manual Run may have started a
+      // new session meanwhile. Only clear the run this branch observed.
+      const current = getQueue(state, projectId).active;
+      const stillThisRun = run !== null
+        && current?.sessionId === run.sessionId
+        && current.startedAt === run.startedAt;
+      if (stillThisRun) finishRun(state, projectId);
+      if (turn.outcome === 'failed') {
+        const detail = describeTurnError(turn.error);
+        const pause = noteFailure(state, projectId, 'run', detail, settingsNow, now);
+        types.push('run.failed');
+        logger.warn('[queue] turn failed', { projectId, sessionId: run?.sessionId, detail });
+        if (pause) {
+          setEnabled(state, projectId, false);
+          resetIdleClock(projectId);
+          types.push('queue.paused');
+          logger.warn('[queue] paused after failed turns', {
+            projectId,
+            failures: settingsNow.maxFailures,
+            detail,
+          });
+        }
+      } else if (turn.outcome === 'succeeded') {
+        noteHealthyRun(state, projectId);
+      } else if (turn.outcome === 'unknown') {
+        logger.warn('[queue] turn outcome unknown', { projectId, sessionId: run?.sessionId });
+      }
       types.push('run.finished');
       continue;
     }
@@ -1048,7 +1250,8 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
       clearSettle(projectId);
       const task = queue.tasks.find((entry) => entry.id === decision.taskId);
       if (!task) break;
-      types.push(await dispatch(projectId, info.directory, task));
+      types.push(...await dispatch(projectId, info.directory, task));
+      if (types.includes('queue.paused')) resetIdleClock(projectId);
       break;
     }
     // Waiting on the settle window (or occupied): re-check when it is up.
@@ -1135,7 +1338,7 @@ const evaluateProject = (projectId: string): void => {
 // ---------------------------------------------------------------------------
 
 type Command = {
-  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'set-task-enabled' | 'set-settings' | 'run-now' | 'set-draft' | 'tick';
+  op: 'register' | 'enqueue' | 'edit' | 'remove' | 'move' | 'run' | 'retry' | 'clear' | 'set-enabled' | 'set-task-enabled' | 'set-settings' | 'resume' | 'run-now' | 'set-draft' | 'tick';
   projectId?: string;
   directory?: string;
   name?: string;
@@ -1165,6 +1368,7 @@ const COMMAND_EVENTS: Partial<Record<Command['op'], QueueEventType>> = {
   'set-enabled': 'queue.enabled',
   'set-task-enabled': 'task.enabled',
   'set-settings': 'queue.settings',
+  resume: 'queue.resumed',
 };
 
 const applyCommand = async (command: Command): Promise<boolean> => {
@@ -1202,7 +1406,19 @@ const applyCommand = async (command: Command): Promise<boolean> => {
     case 'clear':
       return clearTasks(state, projectId);
     case 'set-enabled':
+      // Touching the switch is the user taking over: a self-pause must not leave
+      // the queue stuck once they set the switch themselves.
+      clearPause(state, projectId, true);
+      resetIdleClock(projectId);
       return setEnabled(state, projectId, command.enabled === true);
+    case 'resume': {
+      // The banner's action: lift the pause and start the queue again.
+      const cleared = clearPause(state, projectId, true);
+      resetIdleClock(projectId);
+      const wasEnabled = getQueue(state, projectId).enabled;
+      if (!wasEnabled) setEnabled(state, projectId, true);
+      return cleared || !wasEnabled;
+    }
     case 'set-task-enabled':
       return setTaskEnabled(state, projectId, command.taskId ?? '', command.enabled === true);
     case 'set-settings': {

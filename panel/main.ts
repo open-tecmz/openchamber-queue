@@ -38,6 +38,7 @@ import {
 } from '@openchamber/sdk/ui';
 
 import {
+  MAX_FAILURES_LIMIT,
   MAX_IMAGES_PER_TASK,
   countTasks,
   deriveTitle,
@@ -1225,24 +1226,36 @@ const commitSettings = (patch: QueueSettingsPatch): void => {
   })();
 };
 
+/** How one numeric settings field maps its stored value to and from the box. */
+type NumberFieldOptions = {
+  min: number;
+  max: number;
+  helper: string;
+  invalid: string;
+  toField: (value: number) => number;
+  fromField: (value: number) => number;
+  onCommit: (value: number) => void;
+};
+
 /**
- * A seconds field for one settle window. The value is committed on blur or
- * Enter, never per keystroke: every commit is a state write and an event, and a
- * half-typed number is not a setting. A value outside the accepted range is
- * refused with a message and the stored value stays in force.
+ * A numeric settings field. The value is committed on blur or Enter, never per
+ * keystroke: every commit is a state write and an event, and a half-typed
+ * number is not a setting. A value outside the accepted range is refused with a
+ * message and the stored value stays in force.
  */
-const mountSecondsField = (
+const mountNumberField = (
   host: HTMLElement,
   field: string,
   label: string,
-  initialMs: number,
-  onCommit: (ms: number) => void,
+  initial: number,
+  options: NumberFieldOptions,
 ): void => {
-  let current = String(Math.round(initialMs / 1000));
+  const shown = (): string => String(Math.round(options.toField(initial)));
+  let current = shown();
   const text = mountTextField(host, {
     label,
     value: current,
-    helper: t('settings.range'),
+    helper: options.helper,
     onChange: (value) => {
       current = value;
     },
@@ -1263,20 +1276,58 @@ const mountSecondsField = (
   input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') input.blur();
     if (event.key === 'Escape') {
-      current = input.value = String(Math.round(initialMs / 1000));
+      current = input.value = shown();
       input.blur();
     }
   });
   input.addEventListener('blur', () => {
     settingsFocused = false;
-    const seconds = Number(current.trim());
-    if (!/^\d+$/.test(current.trim()) || seconds < 1 || seconds > 86400) {
-      text.update({ value: current, error: t('settings.invalid') });
+    const value = Number(current.trim());
+    if (!/^\d+$/.test(current.trim()) || value < options.min || value > options.max) {
+      text.update({ value: current, error: options.invalid });
       return;
     }
     text.update({ value: current, error: undefined });
-    const ms = Math.round(seconds) * 1000;
-    if (ms !== initialMs) onCommit(ms);
+    const stored = options.fromField(value);
+    if (stored !== initial) options.onCommit(stored);
+  });
+};
+
+/** A seconds field for one settle window. */
+const mountSecondsField = (
+  host: HTMLElement,
+  field: string,
+  label: string,
+  initialMs: number,
+  onCommit: (ms: number) => void,
+): void => {
+  mountNumberField(host, field, label, initialMs, {
+    min: 1,
+    max: 86400,
+    helper: t('settings.range'),
+    invalid: t('settings.invalid'),
+    toField: (ms) => ms / 1000,
+    fromField: (seconds) => Math.round(seconds) * 1000,
+    onCommit,
+  });
+};
+
+/** A whole-number field for the failure limit, where 0 turns the breaker off. */
+const mountFailureLimitField = (
+  host: HTMLElement,
+  field: string,
+  label: string,
+  initial: number,
+  onCommit: (value: number) => void,
+): void => {
+  mountNumberField(host, field, label, initial, {
+    min: 0,
+    max: MAX_FAILURES_LIMIT,
+    helper: t('settings.countHelper', { max: MAX_FAILURES_LIMIT }),
+    invalid: t('settings.countInvalid', { max: MAX_FAILURES_LIMIT }),
+    toField: (value) => value,
+    fromField: (value) => Math.round(value),
+    onCommit,
   });
 };
 
@@ -1310,6 +1361,13 @@ const renderSettings = (host: HTMLElement): void => {
   const questionHost = delays.appendChild(el('div'));
   mountSecondsField(questionHost, 'settings-question', t('settings.question'), settings.questionDelayMs, (ms) =>
     commitSettings({ questionDelayMs: ms }));
+
+  body.appendChild(el('div', 'qx-settings-idle', t('settings.guard')));
+  body.appendChild(el('div', 'qx-settings-idle qx-settings-hint', t('settings.guardHint')));
+  const guardFields = body.appendChild(el('div', 'qx-settings-delays'));
+  const failuresHost = guardFields.appendChild(el('div'));
+  mountFailureLimitField(failuresHost, 'settings-max-failures', t('settings.maxFailures'), settings.maxFailures, (value) =>
+    commitSettings({ maxFailures: value }));
 
   body.appendChild(el('div', 'qx-settings-idle', t('settings.idle')));
   const boxes = body.appendChild(el('div', 'qx-settings-boxes'));
@@ -1373,6 +1431,8 @@ const render = (): void => {
   }
 
   const counts = countTasks(queue);
+  const settings = settingsOf(queue);
+  const guard = queue.guard;
 
   // Controls live in a scrollable column so a tight panel shortens it instead of
   // pushing the list off the bottom edge; the list below is what flexes.
@@ -1389,6 +1449,15 @@ const render = (): void => {
   if (project) {
     const countsRow = titleRow.appendChild(el('div', 'qx-counts'));
     disposables.push(mountBadge(countsRow, { label: t('count.pending', { n: counts.pending }), tone: 'neutral' }));
+    if (guard?.failures && settings.maxFailures > 0) {
+      disposables.push(mountBadge(countsRow, {
+        label: t('count.errors', { n: guard.failures, max: settings.maxFailures }),
+        tone: 'warning',
+      }));
+    }
+    if (counts.failed > 0) {
+      disposables.push(mountBadge(countsRow, { label: t('count.failed', { n: counts.failed }), tone: 'error' }));
+    }
     disposables.push(mountBadge(countsRow, { label: t('count.completed', { n: counts.completed }), tone: 'success' }));
   }
 
@@ -1401,7 +1470,23 @@ const render = (): void => {
     return;
   }
 
-  const settings = settingsOf(queue);
+  const pause = guard?.pause;
+  if (pause) {
+    const failures = guard?.failures || settings.maxFailures;
+    const body = pause.cause === 'dispatch'
+      ? t('banner.pause.dispatchBody', { n: failures, detail: pause.detail })
+      : t('banner.pause.runBody', { n: failures, detail: pause.detail });
+    disposables.push(mountBanner(controls, {
+      tone: 'warning',
+      title: t('banner.pause.title'),
+      body,
+      action: {
+        label: t('banner.pause.resume'),
+        onClick: () => void pushCommand({ op: 'resume' }),
+      },
+    }));
+  }
+
   const switchHost = controls.appendChild(el('div', 'qx-switch'));
   disposables.push(mountSwitch(switchHost, {
     label: t('switch.label'),

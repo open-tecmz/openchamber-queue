@@ -66,8 +66,12 @@ stays quiet until there is work to do.
 - **Three-line summary** — every task shows its content as a short summary of up
   to three lines, line breaks and all, so a longer prompt is readable without
   opening the editor.
+- **Runaway protection** — a turn whose session ends with outcome `failed`, or a
+  dispatch that cannot create a session, counts as a failure; a few in a row pause
+  the queue before more tasks are spent.
 - **Hand-off queue** — a task is removed and counted in *Done* the moment its
-  session is created; an empty queue turns its own switch off.
+  session is created; a failed turn does not put it back. An empty queue turns its
+  own switch off.
 - **Questions don't block** — a session waiting on a question does not hold the
   project: the next task is dispatched, but only after a longer 5-minute window
   that leaves you room to answer first.
@@ -134,6 +138,39 @@ window; switching *Waiting for permission* or *Running a background command* off
 treats that pause as idle; and switching *Another session is active* off lets the
 queue run even while you work in the same project by hand. `running` and
 `retrying` always hold the queue.
+
+### Runaway protection
+
+Handing a task to a session is not proof that the turn succeeded. A provider that
+is down, out of quota or misconfigured ends the turn with a failed status, and
+without a guard the ordinary settle window would then walk the whole queue,
+consuming one task per failed attempt.
+
+OpenCode writes one `idle` record at the end of every turn with an `outcome`:
+`succeeded`, `failed` with the provider error, or `interrupted` for a manual stop
+or an OpenCode restart. After the run's session frees, the queue reads that
+record through the same proxied session routes as the prompt and classifies the
+turn:
+
+- **succeeded** — a healthy turn; it also clears the consecutive-failure count.
+- **failed** — a real request failure (`provider.transport: Timed out …`, auth,
+  quota, an unknown model). It is counted and its error is kept for the panel.
+- **interrupted** — neither a success nor a failure; the count is left alone.
+
+After **2 consecutive failures** (the default, per project), the queue switches
+itself off and leaves the remaining tasks untouched. The panel shows a banner
+with the last error and a **Resume now** action; the queue only starts again when
+you resume it, so a broken provider cannot consume the list while you are away.
+A dispatch that cannot create the session or send the prompt counts the same
+way; that task stays in the queue as *failed*.
+
+A failed turn's task is not put back: it left the queue when it was handed off,
+and the queue keeps no copy of the prompt to retry. Open the session in
+OpenChamber for its history. Set the limit to 0 to turn the breaker off.
+
+A normal answer that happens to be quick is `succeeded`, so it is not treated as
+a failure. A tool call that exits non-zero is part of a turn, not a failed turn,
+and does not count either.
 
 ### Background service
 
@@ -206,11 +243,13 @@ Other ways to add a task:
 values in force (`30 s idle · 5 min after a question` by default). Expand it to
 set the idle wait and the question wait in seconds, and to choose what counts as
 busy: *Waiting on a question*, *Waiting for permission*, *Running a background
-command* and *Another session is active*. Every change is written to the queue's
-service in the background: a checkbox applies at once, while a time applies on
-Enter or when the field loses focus, so a half-typed number is never stored. A
-short toast confirms each save, and a failure shows its reason. The settings are
-per project and stay in the queue's `state.json`.
+command* and *Another session is active*. The same panel holds **Runaway
+protection**: *Failures before pausing* (2 by default, per project; 0 turns the
+breaker off). Every change is written to the queue's service in the background:
+a checkbox applies at once, while a number applies on Enter or when the field
+loses focus, so a half-typed number is never stored. A short toast confirms each
+save, and a failure shows its reason. The settings are per project and stay in
+the queue's `state.json`.
 
 ## Storage and persistence
 
@@ -271,8 +310,13 @@ panel stays on the connecting state until it is.
   settings and switched onto the session; with neither configured, OpenCode's own
   default applies.
 - **A task counts as done when it is handed off** — the queue sends the prompt but
-  cannot tell whether the agent succeeded. Check the session in OpenChamber for the
-  result.
+  cannot tell whether the agent's work produced a useful result. The breaker does
+  catch a turn that ends with a failed session status; a turn that completes
+  successfully but does the wrong thing is still only visible in the session.
+  A failed turn's task is not returned to the queue.
+- **The outcome is read from the session's `idle` record** — through the proxied
+  session route. If that read fails, the turn is treated as unknown and is not
+  counted, so a broken read never pauses the queue by itself.
 - **Manifest strings are not localizable** — the extension API takes a fixed panel
   name, command description and action label, so they stay in the declared language
   while the panel itself follows OpenChamber's.

@@ -7,7 +7,10 @@
  *
  * Statuses are only pending / failed: a task leaves the queue the moment its
  * session is created and is counted in `completed`. The dispatched session is
- * remembered as the active run only so nothing else starts while it works.
+ * remembered as the active run only so nothing else starts while it works. A
+ * failed turn does not put the task back; the guard below counts consecutive
+ * failed turns and pauses the queue, so a broken model cannot consume the whole
+ * list.
  *
  * A task is its prompt text plus the images attached to it, and a switch the
  * user can turn off so the scheduler passes over it. The bytes never
@@ -140,6 +143,45 @@ export type ActiveRun = {
    * task is running — for external tools and panels that need to tell.
    */
   taskId?: string;
+  /**
+   * Creation time of the newest message the session held just before an append
+   * task's prompt went out. The breaker reads the turn's `idle` record after the
+   * session frees, and this baseline keeps an earlier turn's record from being
+   * mistaken for this one when the settle window is very short.
+   */
+  baselineAt?: number;
+};
+
+/**
+ * A pending self-pause. While one is present the queue dispatches nothing and
+ * waits for the user to resume it.
+ */
+export type QueuePause = {
+  at: number;
+  /** What counted as a failure, so the panel can explain a run and a dispatch differently. */
+  cause: 'run' | 'dispatch';
+  /** The last error, in the form the panel shows and the log keeps. */
+  detail: string;
+};
+
+/**
+ * Runaway protection for one queue.
+ *
+ * Handing a task to a session is not the same as the turn succeeding. A model
+ * whose provider is down, out of quota or misconfigured ends the turn with a
+ * failed session status, and without a breaker the ordinary settle window would
+ * then walk the whole queue, consuming a task for every failed attempt. The
+ * guard counts consecutive failed turns — and dispatches that never reached a
+ * session — and pauses the queue before more tasks are spent.
+ *
+ * A healthy turn clears the count. An interrupted turn (a manual stop or an
+ * OpenCode restart) is neither a success nor a failure and leaves it alone.
+ */
+export type QueueGuard = {
+  /** Consecutive failed turns or failed dispatches; a successful end resets it. */
+  failures: number;
+  /** Present while the queue stopped itself. */
+  pause?: QueuePause;
 };
 
 export type ProjectQueue = {
@@ -154,6 +196,8 @@ export type ProjectQueue = {
    * written before settings existed behaving exactly as it did.
    */
   settings?: QueueSettings;
+  /** Runaway protection state. Absent for a queue that has never needed it. */
+  guard?: QueueGuard;
 };
 
 export type ProjectInfo = {
@@ -238,6 +282,12 @@ export const DEFAULT_IDLE_POLICY: IdlePolicy = {
   otherSessionsBlock: true,
 };
 
+/** Consecutive failed turns (or failed dispatches) that pause the queue. 0 disables the breaker. */
+export const MAX_CONSECUTIVE_FAILURES = 2;
+
+/** The largest value the failure limit may take. */
+export const MAX_FAILURES_LIMIT = 1000;
+
 /**
  * Per-queue dispatch settings. A queue without settings uses the service's own
  * defaults, which are the values below — so an older state file keeps behaving
@@ -248,6 +298,8 @@ export type QueueSettings = {
   dispatchDelayMs: number;
   /** The longer window used after a run ended on a question. */
   questionDelayMs: number;
+  /** Consecutive failed turns or failed dispatches before the queue pauses. 0 turns it off. */
+  maxFailures: number;
   /** What counts as busy while the project is watched. */
   idle: IdlePolicy;
 };
@@ -255,6 +307,7 @@ export type QueueSettings = {
 export const DEFAULT_QUEUE_SETTINGS: QueueSettings = {
   dispatchDelayMs: DISPATCH_DELAY_MS,
   questionDelayMs: QUESTION_DISPATCH_DELAY_MS,
+  maxFailures: MAX_CONSECUTIVE_FAILURES,
   idle: DEFAULT_IDLE_POLICY,
 };
 
@@ -262,12 +315,19 @@ export const DEFAULT_QUEUE_SETTINGS: QueueSettings = {
 export type QueueSettingsPatch = {
   dispatchDelayMs?: number;
   questionDelayMs?: number;
+  maxFailures?: number;
   idle?: Partial<IdlePolicy>;
 };
 
 const sanitizeDelay = (value: unknown, fallback: number): number => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
   return Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, Math.round(value)));
+};
+
+/** A failure limit that may be zero (off), clamped to its upper bound. */
+const sanitizeFailureLimit = (value: unknown, fallback: number): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.min(MAX_FAILURES_LIMIT, Math.max(0, Math.round(value)));
 };
 
 const sanitizeFlag = (value: unknown, fallback: boolean): boolean =>
@@ -283,6 +343,7 @@ export const sanitizeSettings = (
   return {
     dispatchDelayMs: sanitizeDelay(raw.dispatchDelayMs, fallback.dispatchDelayMs),
     questionDelayMs: sanitizeDelay(raw.questionDelayMs, fallback.questionDelayMs),
+    maxFailures: sanitizeFailureLimit(raw.maxFailures, fallback.maxFailures),
     idle: {
       questionBlocks: sanitizeFlag(idle.questionBlocks, fallback.idle.questionBlocks),
       permissionBlocks: sanitizeFlag(idle.permissionBlocks, fallback.idle.permissionBlocks),
@@ -295,6 +356,7 @@ export const sanitizeSettings = (
 const sameSettings = (left: QueueSettings, right: QueueSettings): boolean =>
   left.dispatchDelayMs === right.dispatchDelayMs &&
   left.questionDelayMs === right.questionDelayMs &&
+  left.maxFailures === right.maxFailures &&
   left.idle.questionBlocks === right.idle.questionBlocks &&
   left.idle.permissionBlocks === right.idle.permissionBlocks &&
   left.idle.backgroundBlocks === right.idle.backgroundBlocks &&
@@ -322,6 +384,7 @@ export const updateSettings = (
   const next = sanitizeSettings({
     dispatchDelayMs: patch.dispatchDelayMs ?? base.dispatchDelayMs,
     questionDelayMs: patch.questionDelayMs ?? base.questionDelayMs,
+    maxFailures: patch.maxFailures ?? base.maxFailures,
     idle: { ...base.idle, ...(patch.idle ?? {}) },
   }, defaults);
   if (queue.settings ? sameSettings(next, queue.settings) : sameSettings(next, defaults)) return false;
@@ -345,6 +408,60 @@ export const emptyQueue = (): ProjectQueue => ({
 
 /** A composer with nothing in it. */
 export const emptyDraft = (): QueueDraft => ({ text: '', images: [] });
+
+// ---------------------------------------------------------------------------
+// Runaway protection
+// ---------------------------------------------------------------------------
+
+/**
+ * Count one failed turn or failed dispatch. At the configured limit the queue
+ * pauses and this returns the new pause; before that, or when a pause is
+ * already in place, it returns null so no duplicate event is emitted.
+ */
+export const noteFailure = (
+  state: QueueState,
+  projectId: string,
+  cause: 'run' | 'dispatch',
+  detail: string,
+  settings: QueueSettings,
+  now = Date.now(),
+): QueuePause | null => {
+  const queue = ensureQueue(state, projectId);
+  const guard = queue.guard ?? (queue.guard = { failures: 0 });
+  // A manual run while paused may fail too; the pause already says why, and
+  // counting those would inflate the number the panel explains.
+  if (guard.pause) return null;
+  // The breaker is off: do not keep a count nobody acts on.
+  if (settings.maxFailures <= 0) return null;
+  guard.failures += 1;
+  if (guard.failures < settings.maxFailures) return null;
+  const pause: QueuePause = { at: now, cause, detail };
+  guard.pause = pause;
+  return pause;
+};
+
+/**
+ * A turn that succeeded clears the consecutive-failure count. It does not lift
+ * a pause: a pause waits for the user, who alone knows whether the model has
+ * been fixed.
+ */
+export const noteHealthyRun = (state: QueueState, projectId: string): void => {
+  const guard = state.queues[projectId]?.guard;
+  if (!guard || guard.pause) return;
+  guard.failures = 0;
+};
+
+/**
+ * Lift a pause. Resuming by hand also resets the failure count, so the user
+ * gets a full set of attempts after fixing the model.
+ */
+export const clearPause = (state: QueueState, projectId: string, resetFailures = true): boolean => {
+  const guard = state.queues[projectId]?.guard;
+  if (!guard?.pause) return false;
+  delete guard.pause;
+  if (resetFailures) guard.failures = 0;
+  return true;
+};
 
 export const deriveTitle = (text: string, fallback = 'Queue task'): string => {
   const firstLine = text.trim().split('\n')[0]?.trim() ?? '';
@@ -526,6 +643,13 @@ export const clearTasks = (state: QueueState, projectId: string): boolean => {
   if (!queue) return false;
   queue.tasks = [];
   normalizeQueue(queue);
+  // Emptying the queue is a fresh start: a failure pause no longer has anything
+  // to protect.
+  const guard = queue.guard;
+  if (guard) {
+    delete guard.pause;
+    guard.failures = 0;
+  }
   return true;
 };
 
@@ -568,14 +692,19 @@ export const startTask = (
   projectId: string,
   taskId: string,
   sessionId: string,
-  now = Date.now(),
+  options: { now?: number; baselineAt?: number } = {},
 ): void => {
   const queue = state.queues[projectId];
   const task = queue?.tasks.find((entry) => entry.id === taskId);
   if (!queue || !task) return;
   queue.tasks = queue.tasks.filter((entry) => entry.id !== taskId);
   queue.completed += 1;
-  queue.active = { sessionId, startedAt: now, taskId };
+  queue.active = {
+    sessionId,
+    startedAt: options.now ?? Date.now(),
+    taskId,
+    ...(options.baselineAt !== undefined ? { baselineAt: options.baselineAt } : {}),
+  };
   // Deliberately not normalized here: an empty queue stays enabled while the
   // dispatched session runs, and turns itself off in finishRun.
 };
@@ -684,6 +813,9 @@ export const planTick = (queue: ProjectQueue, observation: TickObservation): Tic
   if (queue.active) {
     return observation.activeStatus === 'running' ? { kind: 'wait' } : { kind: 'finish' };
   }
+  // A self-pause outranks an idle project: nothing is dispatched until the user
+  // resumes the queue.
+  if (queue.guard?.pause) return { kind: 'wait' };
   if (observation.projectBusy) return { kind: 'wait' };
   // Let the project settle before the next task: only a project that has been
   // free for the whole window counts, so anything that wakes up inside it pushes
@@ -739,10 +871,45 @@ export const repairQueue = (queue: ProjectQueue): ProjectQueue => {
   if (queue.active && queue.active.taskId !== undefined && typeof queue.active.taskId !== 'string') {
     delete queue.active.taskId;
   }
+  if (queue.active && queue.active.baselineAt !== undefined
+    && (typeof queue.active.baselineAt !== 'number' || !Number.isFinite(queue.active.baselineAt))) {
+    delete queue.active.baselineAt;
+  }
+  // A run written by the earlier prototype carried a task snapshot; the queue
+  // no longer keeps one.
+  if (queue.active && 'task' in queue.active) {
+    delete (queue.active as { task?: unknown }).task;
+  }
   // A queue customised before a setting existed gains the default for it; a
   // queue that never had settings stays on the service's own defaults.
   if (queue.settings !== undefined) queue.settings = sanitizeSettings(queue.settings);
+  // Guard counters and a pause survive a restart.
+  if (queue.guard !== undefined) queue.guard = repairGuard(queue.guard);
   return queue;
+};
+
+/** A guard read from disk, with every field valid. */
+const repairGuard = (value: unknown): QueueGuard => {
+  const raw = value && typeof value === 'object' ? value as {
+    failures?: unknown;
+    /** The previous shape may still carry `reason` and a `short-run` cause. */
+    pause?: { at?: unknown; detail?: unknown; cause?: unknown; reason?: unknown };
+  } : {};
+  const guard: QueueGuard = {
+    failures: typeof raw.failures === 'number' && Number.isFinite(raw.failures) ? Math.max(0, Math.round(raw.failures)) : 0,
+  };
+  const pause = raw.pause;
+  if (pause && typeof pause.at === 'number' && Number.isFinite(pause.at)
+    && typeof pause.detail === 'string') {
+    // An older pause may still carry `reason`/`cause: 'short-run'`; it is a run
+    // failure under the current shape.
+    guard.pause = {
+      at: pause.at,
+      cause: pause.cause === 'dispatch' ? 'dispatch' : 'run',
+      detail: pause.detail,
+    };
+  }
+  return guard;
 };
 
 /**
@@ -809,7 +976,13 @@ export type QueueEventType =
   /** One task switched on or off for the scheduler — not the queue's own switch. */
   | 'task.enabled'
   | 'queue.settings'
+  /** The queue stopped itself after repeated failed turns or failed dispatches. */
+  | 'queue.paused'
+  /** The user resumed a paused queue. */
+  | 'queue.resumed'
   | 'run.started'
+  /** The session ended with outcome `failed`; the task is not put back. */
+  | 'run.failed'
   | 'run.finished'
   | 'task.failed';
 
