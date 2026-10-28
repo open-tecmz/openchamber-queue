@@ -586,8 +586,37 @@ const listSessions = async (directory: string): Promise<any[] | null> => {
 const hasPending = (result: JsonResult): boolean =>
   result.ok && Array.isArray(result.body?.data) && result.body.data.length > 0;
 
+/** One running shell command, as `/api/shell` reports it. */
+type RunningShell = { id: string; command: string; pid: number | null };
+
+/** A pid the host reported, or null when it did not report a usable one. */
+const asPid = (value: unknown): number | null => {
+  const pid = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+};
+
 /**
- * The sessions in this project that a running shell command belongs to.
+ * Whether the process behind a reported pid still exists.
+ *
+ * `/api/shell` lists only commands that are still running and drops each one as
+ * it exits, so a record whose process is already gone is debris (an older host,
+ * or a process reaped without the record being cleaned up). Waiting for it would
+ * stall the queue for nothing. A pid the host does not report is trusted,
+ * because there is nothing to check; EPERM means the process exists but belongs
+ * to someone else, which is still alive.
+ */
+const pidAlive = (pid: number | null): boolean => {
+  if (pid === null) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+/**
+ * The running shell commands of each session in this project.
  *
  * A session that ended its turn but backgrounded a shell command reports idle,
  * and OpenCode gives it no child session to notice — only the paused turn does.
@@ -596,31 +625,120 @@ const hasPending = (result: JsonResult): boolean =>
  * a positive answer adds occupancy: a host without the route, or a failed read,
  * leaves the check exactly as it was, so an older OpenChamber never stalls.
  */
-const runningShellSessions = async (directory: string): Promise<Set<string>> => {
+const runningShells = async (directory: string): Promise<Map<string, RunningShell[]>> => {
+  const shells = new Map<string, RunningShell[]>();
   const result = await serverGet('/api/shell', directory);
-  if (!result.ok) return new Set();
-  const shells = Array.isArray(result.body?.data) ? result.body.data : [];
-  const ids = new Set<string>();
-  for (const shell of shells) {
+  if (!result.ok) return shells;
+  const data = Array.isArray(result.body?.data) ? result.body.data : [];
+  for (const shell of data) {
+    // The list is documented to hold running commands only; an explicit other
+    // status (an exited command some host still reports) is still not running.
+    if (typeof shell?.status === 'string' && shell.status !== 'running') continue;
     const sessionId = shell?.metadata?.sessionID;
-    if (typeof sessionId === 'string' && sessionId) ids.add(sessionId);
+    if (typeof sessionId !== 'string' || !sessionId) continue;
+    const pid = asPid(shell?.pid);
+    if (!pidAlive(pid)) continue;
+    const list = shells.get(sessionId) ?? [];
+    list.push({
+      id: typeof shell.id === 'string' ? shell.id : `${sessionId}:${list.length}`,
+      command: typeof shell.command === 'string' ? shell.command : '',
+      pid,
+    });
+    shells.set(sessionId, list);
   }
-  return ids;
+  return shells;
+};
+
+/**
+ * When this service first saw a session paused with the same background
+ * commands still running, keyed by session id.
+ *
+ * The clock is the service's own observation, not the command's age: a server
+ * that has been up since before the task began must still get the whole window
+ * after the turn pauses, and a new command on the same session starts a new one.
+ */
+const backgroundSince = new Map<string, { key: string; since: number }>();
+
+/** The command set whose wait was already given up on, so the log says it once. */
+const backgroundGivenUp = new Map<string, string>();
+
+/** Forget a project's background clocks, for when the policy stops reading them. */
+const clearBackgroundClocks = (sessions: any[]): void => {
+  for (const session of sessions) {
+    const id = session?.id;
+    if (typeof id !== 'string') continue;
+    backgroundSince.delete(id);
+    backgroundGivenUp.delete(id);
+  }
+};
+
+/**
+ * Which idle sessions a running background command still holds.
+ *
+ * OpenCode wakes a paused session only when the command it backgrounded exits,
+ * so a command that never exits — a development server, a watcher — would hold
+ * the queue forever. The wait is therefore bounded: after `limitMs` the pause
+ * counts as finished (0 keeps waiting for as long as the command runs). The
+ * session is still watched; if the command does exit and the session wakes, the
+ * project is busy again and the queue waits for it like any other session.
+ */
+const backgroundHolders = (
+  projectId: string,
+  shells: Map<string, RunningShell[]>,
+  paused: Set<string>,
+  limitMs: number,
+  now: number,
+): Set<string> => {
+  const holding = new Set<string>();
+  for (const [sessionId, list] of shells) {
+    const key = list.map((shell) => shell.id).sort().join(',');
+    // A busy session is not waiting on the pause: its window starts when it
+    // pauses, not when the command started, so a foreground command that is
+    // handed to the background late still gets the whole window.
+    if (!paused.has(sessionId)) {
+      backgroundSince.set(sessionId, { key, since: now });
+      backgroundGivenUp.delete(sessionId);
+      continue;
+    }
+    const previous = backgroundSince.get(sessionId);
+    const since = previous && previous.key === key ? previous.since : now;
+    backgroundSince.set(sessionId, { key, since });
+    if (limitMs > 0 && now - since >= limitMs) {
+      if (backgroundGivenUp.get(sessionId) !== key) {
+        backgroundGivenUp.set(sessionId, key);
+        logger.warn('[queue] background command still running, no longer waiting for it', {
+          projectId,
+          sessionId,
+          command: list[0]?.command,
+          waitedMs: now - since,
+        });
+      }
+      continue;
+    }
+    holding.add(sessionId);
+  }
+  // A session with no running command left has nothing to wait for.
+  for (const sessionId of [...backgroundSince.keys()]) {
+    if (shells.has(sessionId)) continue;
+    backgroundSince.delete(sessionId);
+    backgroundGivenUp.delete(sessionId);
+  }
+  return holding;
 };
 
 /**
  * Activity of one session. The control API only reports busy/idle, so a busy
  * session is probed for a pending permission or question — the same
  * permission-then-form precedence the app uses for its own session list. An idle
- * session is still not finished when a shell it backgrounded is still running,
- * so that pause is reported as `background`.
+ * session is still not finished while a shell it backgrounded is still running
+ * inside the wait limit, so that pause is reported as `background`.
  */
 const sessionActivity = async (
   session: any,
   directory: string,
-  shells: Set<string>,
+  background: Set<string>,
 ): Promise<SessionActivity> => {
-  if (isStatusIdle(session)) return shells.has(session.id) ? 'background' : 'idle';
+  if (isStatusIdle(session)) return background.has(session.id) ? 'background' : 'idle';
   const [permission, form] = await Promise.all([
     serverGet(`/api/session/${encodeURIComponent(session.id)}/permission`, directory),
     serverGet(`/api/session/${encodeURIComponent(session.id)}/form`, directory),
@@ -642,9 +760,12 @@ const sessionActivity = async (
  *
  * Running shell commands are read once for the project: a session that
  * backgrounded one looks idle but is not finished, and it must keep both a run
- * of the queue's own and any other session from being treated as free.
+ * of the queue's own and any other session from being treated as free. The wait
+ * is bounded (see `backgroundHolders`), so a command left behind cannot stall
+ * the project forever.
  */
 const observe = async (
+  projectId: string,
   directory: string,
   sessions: any[],
   active: ActiveRun | null,
@@ -654,40 +775,86 @@ const observe = async (
   // The user may not care what the rest of the project is doing: then only the
   // queue's own run decides when it is free, and no other session is probed.
   if (!active && !idle.otherSessionsBlock) {
+    clearBackgroundClocks(sessions);
     return { activeStatus: 'free', projectBusy: false };
   }
   // Backgrounded commands only matter when the queue waits for them; skipping
   // the read saves a request per tick for a policy that ignores them anyway.
-  const shells = idle.backgroundBlocks ? await runningShellSessions(directory) : new Set<string>();
+  let holding = new Set<string>();
+  if (idle.backgroundBlocks) {
+    const paused = new Set(sessions.filter((session) => !session?.archivedAt && isStatusIdle(session)).map((session) => session.id));
+    holding = backgroundHolders(
+      projectId,
+      await runningShells(directory),
+      paused,
+      settings.backgroundTimeoutMs,
+      Date.now(),
+    );
+  } else {
+    clearBackgroundClocks(sessions);
+  }
   if (active) {
     return {
-      activeStatus: await activeStatusFor(active, sessions, directory, shells, idle),
+      activeStatus: await activeStatusFor(active, sessions, directory, holding, idle),
       projectBusy: false,
     };
   }
   const activities = new Map<string, SessionActivity>();
   const busy = sessions.filter((session) => !session?.archivedAt && !isStatusIdle(session));
   await Promise.all(busy.map(async (session) => {
-    activities.set(session.id, await sessionActivity(session, directory, shells));
+    activities.set(session.id, await sessionActivity(session, directory, holding));
   }));
   return {
     activeStatus: 'free',
-    projectBusy: [...activities.values()].some((activity) => isOccupied(activity, idle))
-      || (idle.backgroundBlocks && shells.size > 0),
+    projectBusy: [...activities.values()].some((activity) => isOccupied(activity, idle)) || holding.size > 0,
   };
+};
+
+/**
+ * Every session the run's session spawned, at any depth.
+ *
+ * A background subagent is a child session (`parentID` points at the parent),
+ * and the parent's turn ends the moment it is launched. The parent therefore
+ * looks idle while the review or test the subagent was asked to do is still
+ * running, and OpenCode wakes the parent when it finishes. Nested subagents are
+ * children of that child, so the whole tree is collected: one still working
+ * anywhere below means the run is not finished.
+ */
+const descendantIds = (sessions: any[], sessionId: string): string[] => {
+  const byParent = new Map<string, string[]>();
+  for (const entry of sessions) {
+    const parent = entry?.parentID;
+    const id = entry?.id;
+    if (typeof parent !== 'string' || typeof id !== 'string') continue;
+    const list = byParent.get(parent) ?? [];
+    list.push(id);
+    byParent.set(parent, list);
+  }
+  const ids: string[] = [];
+  const pending = [...(byParent.get(sessionId) ?? [])];
+  const seen = new Set<string>();
+  while (pending.length > 0) {
+    const id = pending.shift() as string;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    pending.push(...(byParent.get(id) ?? []));
+  }
+  return ids;
 };
 
 /**
  * Status of the session this queue itself dispatched: `running` while it really
  * executes, `question` when it only stopped to ask the user something, and
- * `free` as soon as it is idle or gone. A backgrounded shell keeps it `running`:
- * the pause is not the end.
+ * `free` as soon as it is idle or gone. A backgrounded shell keeps it `running`
+ * for as long as the pause still holds the queue, and so does a child session
+ * the run started, until that child is finished too.
  */
 const activeStatusFor = async (
   active: ActiveRun,
   sessions: any[],
   directory: string,
-  shells: Set<string>,
+  holding: Set<string>,
   idle: IdlePolicy,
 ): Promise<ActiveStatus> => {
   const session = sessions.find((entry) => entry?.id === active.sessionId);
@@ -701,8 +868,20 @@ const activeStatusFor = async (
   // reported on its own so the caller can give the user the longer window to
   // answer it. When the policy says a question holds the queue, it is simply
   // still running and the next task waits for the answer.
-  const activity = await sessionActivity(session, directory, shells);
+  const activity = await sessionActivity(session, directory, holding);
   if (activity === 'waiting-question') return idle.questionBlocks ? 'running' : 'question';
+  // A subagent (or a command it backgrounded) is real work the run is waiting
+  // on, not a pause: no deadline applies, and the run ends only once the whole
+  // tree below it is idle again.
+  const byId = new Map<string, any>();
+  for (const entry of sessions) {
+    if (typeof entry?.id === 'string') byId.set(entry.id, entry);
+  }
+  for (const id of descendantIds(sessions, active.sessionId)) {
+    const child = byId.get(id);
+    if (!child || child.archivedAt) continue;
+    if (!isStatusIdle(child) || holding.has(id)) return 'running';
+  }
   return isOccupied(activity, idle) ? 'running' : 'free';
 };
 
@@ -1185,7 +1364,7 @@ const runProject = async (projectId: string): Promise<QueueEventType[]> => {
     if (offlineProjects.delete(projectId)) {
       logger.info('[queue] sessions reachable again', { projectId });
     }
-    const observation = await observe(info.directory, sessions, queue.active, queueSettings(queue));
+    const observation = await observe(projectId, info.directory, sessions, queue.active, queueSettings(queue));
     const now = Date.now();
     const free = queue.active === null && !observation.projectBusy;
     // Anything but a free project ends the current window, so a run in flight

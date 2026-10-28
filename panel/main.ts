@@ -38,6 +38,7 @@ import {
 } from '@openchamber/sdk/ui';
 
 import {
+  MAX_DELAY_MS,
   MAX_FAILURES_LIMIT,
   MAX_IMAGES_PER_TASK,
   countTasks,
@@ -1312,6 +1313,30 @@ const mountSecondsField = (
   });
 };
 
+/**
+ * The background wait in minutes, where 0 keeps waiting for as long as the
+ * command runs. Minutes rather than seconds: the useful values here are whole
+ * minutes, and the stored setting is the same milliseconds either way.
+ */
+const mountBackgroundTimeoutField = (
+  host: HTMLElement,
+  field: string,
+  label: string,
+  initialMs: number,
+  onCommit: (ms: number) => void,
+): void => {
+  const maxMinutes = MAX_DELAY_MS / 60000;
+  mountNumberField(host, field, label, initialMs, {
+    min: 0,
+    max: maxMinutes,
+    helper: t('settings.backgroundHelper', { max: maxMinutes }),
+    invalid: t('settings.backgroundInvalid', { max: maxMinutes }),
+    toField: (ms) => ms / 60000,
+    fromField: (minutes) => Math.round(minutes) * 60000,
+    onCommit,
+  });
+};
+
 /** A whole-number field for the failure limit, where 0 turns the breaker off. */
 const mountFailureLimitField = (
   host: HTMLElement,
@@ -1368,6 +1393,16 @@ const renderSettings = (host: HTMLElement): void => {
   const failuresHost = guardFields.appendChild(el('div'));
   mountFailureLimitField(failuresHost, 'settings-max-failures', t('settings.maxFailures'), settings.maxFailures, (value) =>
     commitSettings({ maxFailures: value }));
+  // A background command is the other way a run can hold a project open without
+  // progress: the limit is what stops a command that never exits from doing so.
+  const backgroundHost = guardFields.appendChild(el('div'));
+  mountBackgroundTimeoutField(
+    backgroundHost,
+    'settings-background-timeout',
+    t('settings.backgroundTimeout'),
+    settings.backgroundTimeoutMs,
+    (ms) => commitSettings({ backgroundTimeoutMs: ms }),
+  );
 
   body.appendChild(el('div', 'qx-settings-idle', t('settings.idle')));
   const boxes = body.appendChild(el('div', 'qx-settings-boxes'));

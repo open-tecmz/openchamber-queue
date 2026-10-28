@@ -245,6 +245,19 @@ export const DISPATCH_DELAY_MS = 30000;
  */
 export const QUESTION_DISPATCH_DELAY_MS = 300000;
 
+/**
+ * The default longest a running background command may hold a queue.
+ *
+ * A session that sent a command to the background reports idle, but OpenCode
+ * wakes it again only when that command exits. A command that never exits — a
+ * development server, a watcher — would therefore hold the queue forever, so
+ * the pause stops counting as busy after this window. The same record is all
+ * OpenCode keeps, so a long test run and a forgotten server look alike: the
+ * window is generous enough for an hour-long test, and a queue that wants to
+ * wait forever sets 0. A queue with its own settings uses its own value.
+ */
+export const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
 /** The shortest settle window a queue may be set to (one second). */
 export const MIN_DELAY_MS = 1000;
 /** The longest settle window a queue may be set to (one day). */
@@ -298,6 +311,8 @@ export type QueueSettings = {
   dispatchDelayMs: number;
   /** The longer window used after a run ended on a question. */
   questionDelayMs: number;
+  /** How long a running background command may hold the queue. 0 waits forever. */
+  backgroundTimeoutMs: number;
   /** Consecutive failed turns or failed dispatches before the queue pauses. 0 turns it off. */
   maxFailures: number;
   /** What counts as busy while the project is watched. */
@@ -307,6 +322,7 @@ export type QueueSettings = {
 export const DEFAULT_QUEUE_SETTINGS: QueueSettings = {
   dispatchDelayMs: DISPATCH_DELAY_MS,
   questionDelayMs: QUESTION_DISPATCH_DELAY_MS,
+  backgroundTimeoutMs: BACKGROUND_TIMEOUT_MS,
   maxFailures: MAX_CONSECUTIVE_FAILURES,
   idle: DEFAULT_IDLE_POLICY,
 };
@@ -315,6 +331,7 @@ export const DEFAULT_QUEUE_SETTINGS: QueueSettings = {
 export type QueueSettingsPatch = {
   dispatchDelayMs?: number;
   questionDelayMs?: number;
+  backgroundTimeoutMs?: number;
   maxFailures?: number;
   idle?: Partial<IdlePolicy>;
 };
@@ -330,6 +347,12 @@ const sanitizeFailureLimit = (value: unknown, fallback: number): number => {
   return Math.min(MAX_FAILURES_LIMIT, Math.max(0, Math.round(value)));
 };
 
+/** A background wait that may be zero (wait forever), clamped to its upper bound. */
+const sanitizeBackgroundTimeout = (value: unknown, fallback: number): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.min(MAX_DELAY_MS, Math.max(0, Math.round(value)));
+};
+
 const sanitizeFlag = (value: unknown, fallback: boolean): boolean =>
   typeof value === 'boolean' ? value : fallback;
 
@@ -343,6 +366,7 @@ export const sanitizeSettings = (
   return {
     dispatchDelayMs: sanitizeDelay(raw.dispatchDelayMs, fallback.dispatchDelayMs),
     questionDelayMs: sanitizeDelay(raw.questionDelayMs, fallback.questionDelayMs),
+    backgroundTimeoutMs: sanitizeBackgroundTimeout(raw.backgroundTimeoutMs, fallback.backgroundTimeoutMs),
     maxFailures: sanitizeFailureLimit(raw.maxFailures, fallback.maxFailures),
     idle: {
       questionBlocks: sanitizeFlag(idle.questionBlocks, fallback.idle.questionBlocks),
@@ -356,6 +380,7 @@ export const sanitizeSettings = (
 const sameSettings = (left: QueueSettings, right: QueueSettings): boolean =>
   left.dispatchDelayMs === right.dispatchDelayMs &&
   left.questionDelayMs === right.questionDelayMs &&
+  left.backgroundTimeoutMs === right.backgroundTimeoutMs &&
   left.maxFailures === right.maxFailures &&
   left.idle.questionBlocks === right.idle.questionBlocks &&
   left.idle.permissionBlocks === right.idle.permissionBlocks &&
@@ -384,6 +409,7 @@ export const updateSettings = (
   const next = sanitizeSettings({
     dispatchDelayMs: patch.dispatchDelayMs ?? base.dispatchDelayMs,
     questionDelayMs: patch.questionDelayMs ?? base.questionDelayMs,
+    backgroundTimeoutMs: patch.backgroundTimeoutMs ?? base.backgroundTimeoutMs,
     maxFailures: patch.maxFailures ?? base.maxFailures,
     idle: { ...base.idle, ...(patch.idle ?? {}) },
   }, defaults);

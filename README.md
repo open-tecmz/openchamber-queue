@@ -126,9 +126,18 @@ own model, agent and history.
 `waiting-question` is **not** considered occupied by default, so an agent that is
 asking a question never blocks the queue — its task is already handed off, and
 the next one simply waits out the longer question window — while a session
-you started yourself does make the queue wait its turn. A session that sent a
-command to the background also counts as executing: it reports idle while the
-command runs, and the queue waits for that command to finish before it moves on.
+you started yourself does make the queue wait its turn.
+
+A run that leaves work running in the background is not finished yet: a session
+that sent a command to the background reports idle while the command runs, and
+the queue waits for it. A background subagent is a child session, and the parent
+goes idle the moment it is launched, so the queue follows the child (at any
+depth) until it really finishes instead of calling the run done. A background
+command is different: OpenCode keeps no record of what it is for, so an
+hour-long test and a forgotten server look alike, and the wait is bounded —
+after **Background command wait limit** (2 hours by default, per project; 0
+keeps waiting) the pause counts as idle. The session stays watched either way,
+so if the command exits later and wakes it, the project is busy again.
 
 The dispatch settings turn those defaults into per-project choices. Under
 **A session holds the queue while it is**, *Waiting on a question* is off and the
@@ -245,9 +254,10 @@ set the idle wait and the question wait in seconds, and to choose what counts as
 busy: *Waiting on a question*, *Waiting for permission*, *Running a background
 command* and *Another session is active*. The same panel holds **Runaway
 protection**: *Failures before pausing* (2 by default, per project; 0 turns the
-breaker off). Every change is written to the queue's service in the background:
-a checkbox applies at once, while a number applies on Enter or when the field
-loses focus, so a half-typed number is never stored. A short toast confirms each
+breaker off) and *Background command wait limit* (2 hours by default; 0 waits
+for as long as the command runs). Every change is written to the queue's service
+in the background: a checkbox applies at once, while a number applies on Enter or
+when the field loses focus, so a half-typed number is never stored. A short toast confirms each
 save, and a failure shows its reason. The settings are per project and stay in
 the queue's `state.json`.
 
