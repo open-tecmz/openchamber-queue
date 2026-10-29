@@ -214,10 +214,17 @@ const endPending = (): void => {
   syncBusy();
 };
 
+/** Tell the user why a control did nothing: no control has an inline error slot. */
+const reportError = (error: unknown): void => {
+  void host.toast({ kind: 'error', message: error instanceof Error ? error.message : String(error) });
+};
+
 /** Runs `task` with the button spun up until it settles. */
 const withLoading = (handle: ButtonHandle, task: () => Promise<void>): void => {
   handle.update({ loading: true });
-  void task().finally(() => handle.update({ loading: false }));
+  void task()
+    .catch(reportError)
+    .finally(() => handle.update({ loading: false }));
 };
 
 // ---------------------------------------------------------------------------
@@ -679,7 +686,14 @@ document.addEventListener('drop', (event) => {
 
 const pushCommand = async (command: Record<string, unknown>): Promise<void> => {
   const current = project;
-  if (!current || mode === 'unknown') return;
+  if (!current) return;
+  if (mode === 'unknown') {
+    // Every control in the panel goes through here, so a queue reported as
+    // unreachable would otherwise swallow the click in silence and read as a
+    // dead button. Say why nothing happened instead.
+    await host.toast({ kind: 'error', message: t('toast.connecting') });
+    return;
+  }
   beginPending();
   try {
     // A command answers as soon as it applied its change, before the dispatch it
@@ -698,13 +712,22 @@ const pushCommand = async (command: Record<string, unknown>): Promise<void> => {
   }
 };
 
+/** A command from a control with nowhere to show a failure: report it instead of dropping it. */
+const runCommand = (command: Record<string, unknown>): void => {
+  void pushCommand(command).catch(reportError);
+};
+
 /**
  * "Run now": create a session with the composer immediately instead of
  * queueing it. The service owns dispatch, so the command is all this sends.
  */
 const runNow = async (text: string, images: TaskImage[]): Promise<boolean> => {
   const trimmed = text.trim();
-  if (!trimmed || !project || mode === 'unknown') return false;
+  if (!trimmed || !project) return false;
+  if (mode === 'unknown') {
+    await host.toast({ kind: 'error', message: t('toast.connecting') });
+    return false;
+  }
   beginPending();
   try {
     await backend.command(project.id, { op: 'run-now', text: trimmed, images });
@@ -1207,7 +1230,7 @@ const formatDelay = (ms: number): string =>
 /** Send one partial settings change; the service merges it into the queue's own. */
 const commitSettings = (patch: QueueSettingsPatch): void => {
   if (!project || mode === 'unknown') {
-    void host.toast({ kind: 'error', message: t('toast.noService') });
+    void host.toast({ kind: 'error', message: t('toast.connecting') });
     return;
   }
   // No explicit save button: the change is written to the service as soon as it
@@ -1483,13 +1506,11 @@ const render = (): void => {
 
   if (project) {
     const countsRow = titleRow.appendChild(el('div', 'qx-counts'));
+    // The failure streak is a state, not a count: it used to sit here as an
+    // "n/max errors" badge that looked like a control but offered nothing to
+    // click. The banner below reports it once the queue actually pauses, next to
+    // the one action that matters, so the title row keeps only real task counts.
     disposables.push(mountBadge(countsRow, { label: t('count.pending', { n: counts.pending }), tone: 'neutral' }));
-    if (guard?.failures && settings.maxFailures > 0) {
-      disposables.push(mountBadge(countsRow, {
-        label: t('count.errors', { n: guard.failures, max: settings.maxFailures }),
-        tone: 'warning',
-      }));
-    }
     if (counts.failed > 0) {
       disposables.push(mountBadge(countsRow, { label: t('count.failed', { n: counts.failed }), tone: 'error' }));
     }
@@ -1507,17 +1528,17 @@ const render = (): void => {
 
   const pause = guard?.pause;
   if (pause) {
-    const failures = guard?.failures || settings.maxFailures;
+    const count = guard?.failures || settings.maxFailures;
     const body = pause.cause === 'dispatch'
-      ? t('banner.pause.dispatchBody', { n: failures, detail: pause.detail })
-      : t('banner.pause.runBody', { n: failures, detail: pause.detail });
+      ? t('banner.pause.dispatchBody', { n: count, detail: pause.detail })
+      : t('banner.pause.runBody', { n: count, detail: pause.detail });
     disposables.push(mountBanner(controls, {
       tone: 'warning',
       title: t('banner.pause.title'),
       body,
       action: {
         label: t('banner.pause.resume'),
-        onClick: () => void pushCommand({ op: 'resume' }),
+        onClick: () => runCommand({ op: 'resume' }),
       },
     }));
   }
@@ -1529,7 +1550,7 @@ const render = (): void => {
       ? t('switch.on', { delay: formatDelay(settings.dispatchDelayMs), question: formatDelay(settings.questionDelayMs) })
       : t('switch.off'),
     checked: queue.enabled,
-    onChange: (next) => void pushCommand({ op: 'set-enabled', enabled: next }),
+    onChange: (next) => runCommand({ op: 'set-enabled', enabled: next }),
   }));
 
   renderSettings(controls);
@@ -1789,7 +1810,7 @@ const renderTask = (task: QueueTask, position: number): HTMLElement => {
   const enabledBox = mountCheckbox(actions, {
     label: t('row.enabled'),
     checked: task.enabled,
-    onChange: (next) => void pushCommand({ op: 'set-task-enabled', taskId: task.id, enabled: next }),
+    onChange: (next) => runCommand({ op: 'set-task-enabled', taskId: task.id, enabled: next }),
   });
   disposables.push(enabledBox);
 
@@ -1829,7 +1850,7 @@ const renderEditor = (task: QueueTask): HTMLElement => {
       const id = task.id;
       const images = editingImages.map(toTaskImage);
       endEdit();
-      void pushCommand({ op: 'edit', taskId: id, text, images });
+      runCommand({ op: 'edit', taskId: id, text, images });
     },
   }));
   disposables.push(mountButton(actions, {

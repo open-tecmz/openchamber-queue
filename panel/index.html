@@ -291,9 +291,10 @@
       .qx-row-sub {
         color: var(--oc-muted);
         font-size: 11px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        /* Wraps instead of truncating: the session a task appends to has to read
+           in full, and so does a failure reason, however long the title is. */
+        white-space: normal;
+        overflow-wrap: anywhere;
       }
       .qx-row-actions {
         display: flex;
