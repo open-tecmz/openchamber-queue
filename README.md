@@ -223,8 +223,10 @@ Open the **Queue** panel from the extensions area of the rail:
    session that is open right now.
 2. Optionally attach up to four images: paste a screenshot into the box, drop
    files on the panel, or press **Add image**. They travel with the task and are
-   sent as images on the session's first prompt. A task needs text; the images
-   ride along with it.
+   sent as images on the session's first prompt. Pasting an image also inserts a
+   `[file name]` reference at the caret (a duplicate name gets a number, such as
+   `[file-2]`), so several pasted images stay distinguishable. A task needs
+   text; the images ride along with it.
 3. Turn on **Enable queue**.
 4. Leave it alone. Once the project has been idle for the queue's wait (30
    seconds by default), the first task runs; when it finishes the next one
@@ -240,8 +242,8 @@ skips the task, leaving it in its place — a manual *Run* still works. The *New
 task* line has the same checkbox for tasks you are about to add: it decides
 whether they start enabled (on by default), so you can queue a batch to review
 before any of it runs. With the queue stopped, click a row to expand it into an
-editor with **Save** / **Cancel** — there the text can be changed and an image
-dropped with the × on its chip.
+editor with **Save** / **Cancel** — there the text can be changed, an image
+pasted, and a chip removed with its ×.
 
 Other ways to add a task:
 

@@ -560,6 +560,26 @@ const removeEditorImage = (id: string): void => {
   refreshEditorStrip();
 };
 
+/**
+ * Which field an attached image belongs to. Both the composer and the task
+ * editor accept images, and each keeps its own list: the composer mirrors its
+ * list to the draft, the editor only hands its list over on Save.
+ */
+type ImageOwner = 'composer' | 'editor';
+
+const imagesFor = (owner: ImageOwner): ComposerImage[] =>
+  owner === 'composer' ? composerImages : editingImages;
+
+const setImagesFor = (owner: ImageOwner, images: ComposerImage[]): void => {
+  if (owner === 'composer') composerImages = images;
+  else editingImages = images;
+};
+
+const refreshImagesFor = (owner: ImageOwner): void => {
+  if (owner === 'composer') refreshComposerStrip();
+  else refreshEditorStrip();
+};
+
 /** The preview the service kept, for an image restored from a draft. */
 const loadThumb = async (image: ComposerImage, owner: string): Promise<void> => {
   if (image.thumb) return;
@@ -575,26 +595,52 @@ const loadThumb = async (image: ComposerImage, owner: string): Promise<void> => 
 };
 
 /**
- * Upload one image to the service's store. The chip appears at once and shows
- * that it is still arriving; a failure takes it away again and says so.
+ * A name no image on the same field already carries, so a pasted screenshot can
+ * be referred to unambiguously: `shot.png`, `shot-2.png`, `shot-3.png`.
  */
-const uploadImage = async (file: File): Promise<void> => {
-  const id = `img_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+const uniqueImageName = (name: string, images: readonly ComposerImage[]): string => {
+  const used = new Set(images.map((image) => image.name));
+  if (!used.has(name)) return name;
+  const dot = name.lastIndexOf('.');
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const extension = dot > 0 ? name.slice(dot) : '';
+  let index = 2;
+  while (used.has(`${stem}-${index}${extension}`)) index += 1;
+  return `${stem}-${index}${extension}`;
+};
+
+/** The bracket reference a pasted image leaves in the task text. */
+const imageReference = (image: ComposerImage): string =>
+  `[${image.name.replace(/[\r\n]+/g, ' ').replace(/]/g, ')')}]`;
+
+/** Put an image on the strip at once; its bytes travel behind it. */
+const newComposerImage = (file: File, owner: ImageOwner): ComposerImage => {
+  const images = imagesFor(owner);
   const image: ComposerImage = {
-    id,
-    name: file.name || t('composer.image.untitled'),
+    id: `img_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    name: uniqueImageName(file.name || t('composer.image.untitled'), images),
     mime: file.type || 'application/octet-stream',
     size: file.size,
     thumb: null,
     uploading: true,
   };
-  composerImages = [...composerImages, image];
-  refreshComposerStrip();
+  setImagesFor(owner, [...images, image]);
+  refreshImagesFor(owner);
+  return image;
+};
+
+/**
+ * Send one image's bytes to the service's store. The chip is already on screen
+ * and shows that it is still arriving; a failure takes it away again and says
+ * so.
+ */
+const uploadImage = async (image: ComposerImage, file: File, owner: ImageOwner): Promise<void> => {
+  const id = image.id;
   beginPending();
   let started = false;
   try {
     image.thumb = await makeThumbnail(file);
-    refreshComposerStrip();
+    refreshImagesFor(owner);
     const base64 = bytesToBase64(new Uint8Array(await file.arrayBuffer()));
     await backend.imageBegin(id, image.name, image.mime);
     started = true;
@@ -606,41 +652,77 @@ const uploadImage = async (file: File): Promise<void> => {
     image.mime = stored.mime;
     image.size = stored.size;
     image.uploading = false;
-    // The draft has to name the image for the sweep to keep it.
-    touchComposer();
+    // The composer draft has to name the image for the sweep to keep it.
+    if (owner === 'composer') touchComposer();
   } catch {
-    composerImages = composerImages.filter((entry) => entry.id !== id);
+    setImagesFor(owner, imagesFor(owner).filter((entry) => entry.id !== id));
     if (started) await backend.imageAbort(id).catch(() => undefined);
     await host.toast({ kind: 'error', message: t('composer.image.failed') });
   } finally {
     endPending();
-    refreshComposerStrip();
+    refreshImagesFor(owner);
   }
 };
 
-/** Attach files the user picked, pasted or dropped. */
-const addImageFiles = async (files: readonly File[]): Promise<void> => {
-  if (!project || mode === 'unknown' || files.length === 0) return;
+/** The image files among `files` that the field can still take. */
+const acceptableImageFiles = (files: readonly File[], owner: ImageOwner): File[] => {
   const images = files.filter((file) => file.type.startsWith('image/') && file.size > 0);
-  if (images.length === 0) return;
-  const room = MAX_IMAGES_PER_TASK - composerImages.length;
+  if (images.length === 0) return [];
+  const room = Math.max(0, MAX_IMAGES_PER_TASK - imagesFor(owner).length);
   if (images.length > room) {
-    await host.toast({ kind: 'info', message: t('composer.image.tooMany', { n: MAX_IMAGES_PER_TASK }) });
+    void host.toast({ kind: 'info', message: t('composer.image.tooMany', { n: MAX_IMAGES_PER_TASK }) });
   }
-  for (const file of images.slice(0, Math.max(0, room))) {
+  const accepted: File[] = [];
+  for (const file of images) {
+    if (accepted.length >= room) break;
     if (file.size > MAX_IMAGE_BYTES) {
-      await host.toast({
+      void host.toast({
         kind: 'error',
         message: t('composer.image.tooLarge', { max: formatMegabytes(MAX_IMAGE_BYTES) }),
       });
       continue;
     }
-    await uploadImage(file);
+    accepted.push(file);
   }
+  return accepted;
 };
 
-/** A paste that carries an image attaches it instead of being dropped. */
-const handleComposerPaste = (event: ClipboardEvent): void => {
+/** Attach files the user picked, pasted or dropped. */
+const addImageFiles = async (files: readonly File[], owner: ImageOwner): Promise<ComposerImage[]> => {
+  if (!project || mode === 'unknown') return [];
+  const accepted = acceptableImageFiles(files, owner);
+  const added: ComposerImage[] = [];
+  for (const file of accepted) {
+    const image = newComposerImage(file, owner);
+    added.push(image);
+    await uploadImage(image, file, owner);
+  }
+  return added;
+};
+
+/**
+ * Insert text at the caret, replacing any selection, and let the field's own
+ * change handler see it: that is what keeps the draft, the composer state and
+ * the editor's Save button in step with text the handler wrote itself.
+ */
+const insertAtCaret = (input: HTMLTextAreaElement, text: string): void => {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  input.setRangeText(text, start, end, 'end');
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+};
+
+/**
+ * A paste that carries an image attaches it to `owner` and names it in the
+ * text, so several pasted screenshots stay distinguishable: the reference is
+ * `[file name]`, with a numbered suffix when the names would collide.
+ */
+const handleImagePaste = (
+  event: ClipboardEvent,
+  input: HTMLTextAreaElement,
+  owner: ImageOwner,
+): void => {
+  if (!project || mode === 'unknown') return;
   const data = event.clipboardData;
   if (!data) return;
   const files = [...data.items]
@@ -648,9 +730,18 @@ const handleComposerPaste = (event: ClipboardEvent): void => {
     .map((item) => item.getAsFile())
     .filter((file): file is File => file !== null);
   if (files.length === 0) return;
-  // Text in the same paste still lands in the field; the image joins the task.
-  if (!data.getData('text/plain')) event.preventDefault();
-  void addImageFiles(files);
+  const accepted = acceptableImageFiles(files, owner);
+  // Nothing can be attached: leave the paste to the browser, which still
+  // inserts any text that came with it.
+  if (accepted.length === 0) return;
+  // Take the paste over: the text, if any, and the image references are
+  // written here so their order is known.
+  event.preventDefault();
+  const text = data.getData('text/plain');
+  if (text) insertAtCaret(input, text);
+  const images = accepted.map((file) => newComposerImage(file, owner));
+  insertAtCaret(input, `${images.map(imageReference).join(' ')} `);
+  images.forEach((image, index) => void uploadImage(image, accepted[index], owner));
 };
 
 /** The hidden picker behind the "Add image" button. */
@@ -662,7 +753,7 @@ filePicker.hidden = true;
 filePicker.addEventListener('change', () => {
   const files = [...(filePicker.files ?? [])];
   filePicker.value = '';
-  void addImageFiles(files);
+  void addImageFiles(files, 'composer');
 });
 document.body.appendChild(filePicker);
 
@@ -677,7 +768,7 @@ document.addEventListener('drop', (event) => {
   const files = [...(event.dataTransfer?.files ?? [])];
   if (files.length === 0) return;
   event.preventDefault();
-  void addImageFiles(files);
+  void addImageFiles(files, 'composer');
 });
 
 // ---------------------------------------------------------------------------
@@ -1119,7 +1210,7 @@ const mountGrowingField = (
     ariaLabel?: string;
     onFocus?: () => void;
     onBlur?: () => void;
-    onPaste?: (event: ClipboardEvent) => void;
+    onPaste?: (event: ClipboardEvent, input: HTMLTextAreaElement) => void;
   } = {},
 ): TextFieldHandle => {
   const field = mountTextField(root, initial);
@@ -1130,7 +1221,9 @@ const mountGrowingField = (
   if (options.ariaLabel) input.setAttribute('aria-label', options.ariaLabel);
   if (options.onFocus) input.addEventListener('focus', options.onFocus);
   if (options.onBlur) input.addEventListener('blur', options.onBlur);
-  if (options.onPaste) input.addEventListener('paste', options.onPaste as EventListener);
+  if (options.onPaste) {
+    input.addEventListener('paste', (event) => options.onPaste?.(event as ClipboardEvent, input));
+  }
 
   // A floor for `height: auto` before the element has been laid out, and the
   // size an empty field keeps: the panel can mount while the rail is still
@@ -1591,7 +1684,7 @@ const render = (): void => {
     {
       field: 'composer',
       ariaLabel: t('composer.label'),
-      onPaste: handleComposerPaste,
+      onPaste: (event, input) => handleImagePaste(event, input, 'composer'),
       onFocus: () => {
         composerFocused = true;
         // Seal the render key so the next background queue event is a no-op for
@@ -1836,7 +1929,10 @@ const renderEditor = (task: QueueTask): HTMLElement => {
       draftText = value;
       field.update({ value });
     },
-  }, { field: 'editor' });
+  }, {
+    field: 'editor',
+    onPaste: (event, input) => handleImagePaste(event, input, 'editor'),
+  });
   disposables.push(field);
 
   const actions = card.appendChild(el('div', 'qx-edit-actions'));
@@ -1847,6 +1943,10 @@ const renderEditor = (task: QueueTask): HTMLElement => {
     onClick: () => {
       const text = draftText.trim();
       if (!text) return;
+      if (editingImages.some((image) => image.uploading)) {
+        void host.toast({ kind: 'info', message: t('composer.image.wait') });
+        return;
+      }
       const id = task.id;
       const images = editingImages.map(toTaskImage);
       endEdit();
