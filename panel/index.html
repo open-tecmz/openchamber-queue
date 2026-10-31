@@ -1,0 +1,443 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="light dark" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        background: var(--oc-bg);
+        color: var(--oc-fg);
+        font: 13px/1.5 var(--oc-font, system-ui, sans-serif);
+      }
+      #root {
+        height: 100%;
+        box-sizing: border-box;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        overflow: hidden;
+      }
+      /* The controls (header, banner, switch, composer) keep their natural
+         height and share the leftover space with the list, which is the only
+         region that grows. When the panel is too short for both, the controls
+         scroll instead of pushing the list past the bottom edge. */
+      .qx-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        flex: 0 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+      }
+      .qx-switch {
+        flex: none;
+      }
+      /* Per-queue dispatch settings: a collapsed disclosure by default, so the
+         rail stays quiet, with the values in force on its summary line. */
+      .qx-settings {
+        flex: none;
+        border: 1px solid var(--oc-border);
+        border-radius: var(--oc-radius, 8px);
+      }
+      .qx-settings-summary {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 6px 8px;
+        cursor: pointer;
+        list-style: none;
+        font-size: 12px;
+        user-select: none;
+      }
+      .qx-settings-summary::-webkit-details-marker {
+        display: none;
+      }
+      .qx-settings-summary::before {
+        content: '▸';
+        flex: none;
+        color: var(--oc-muted);
+        transition: transform 120ms ease-out;
+      }
+      .qx-settings[open] .qx-settings-summary::before {
+        transform: rotate(90deg);
+      }
+      .qx-settings-title {
+        font-weight: 500;
+        /* The title is a phrase, not a label to hyphenate: keep it whole and let
+           the values drop to their own line instead. */
+        white-space: nowrap;
+      }
+      .qx-settings-values {
+        margin-left: auto;
+        color: var(--oc-muted);
+        font-size: 11px;
+        text-align: right;
+      }
+      .qx-settings-body {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 0 8px 8px;
+      }
+      .qx-settings-delays {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .qx-settings-delays > div {
+        flex: 1 1 120px;
+        min-width: 0;
+      }
+      .qx-settings-idle {
+        color: var(--oc-muted);
+        font-size: 0.75rem;
+      }
+      .qx-settings-hint {
+        line-height: 1.45;
+        margin-top: -4px;
+      }
+      .qx-settings-boxes {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .qx-header {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        flex: none;
+      }
+      .qx-title-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .qx-title {
+        font-weight: 650;
+        font-size: 14px;
+      }
+      .qx-project {
+        color: var(--oc-muted);
+        font-size: 12px;
+        word-break: break-all;
+      }
+      .qx-counts {
+        margin-left: auto;
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .qx-composer {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        flex: none;
+      }
+      /* The composer's caption line: the field label on the left, the "new tasks
+         are enabled" switch on the right. */
+      .qx-composer-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .qx-composer-label {
+        font-size: 0.8125rem;
+        font-weight: 500;
+      }
+      .qx-composer-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        justify-content: flex-start;
+      }
+      /* The host repaints the kit's buttons for the app: an inset ring plus a
+         1px lift shadow under the button. At these sizes that lift reads as a
+         second line below the button, so every button in the panel keeps the
+         edge as a real border and drops the shadow. Carrying the kit's root
+         class as well outranks the host's own button rules, whichever style
+         sheet it appends last. */
+      button.oc-sdk.oc-sdk-btn {
+        box-shadow: none;
+      }
+      button.oc-sdk.oc-sdk-btn[data-variant="outline"] {
+        border-color: var(--oc-sdk-edge, var(--oc-border));
+      }
+      /* What is attached to the composer or to the task being edited. */
+      .qx-images {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .qx-images[hidden] {
+        display: none;
+      }
+      .qx-image {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        padding: 3px 4px 3px 3px;
+        border: 1px solid var(--oc-border);
+        border-radius: var(--oc-radius, 8px);
+        background: var(--oc-elevated, transparent);
+        font-size: 11px;
+      }
+      .qx-image-uploading {
+        opacity: 0.7;
+      }
+      .qx-image-thumb {
+        width: 22px;
+        height: 22px;
+        flex: none;
+        border-radius: 4px;
+        object-fit: cover;
+        display: block;
+      }
+      .qx-image-thumb-empty {
+        border: 1px dashed var(--oc-border);
+      }
+      .qx-image-name {
+        min-width: 0;
+        max-width: 160px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .qx-image-remove {
+        flex: none;
+        width: 16px;
+        height: 16px;
+        padding: 0;
+        border: 0;
+        border-radius: 50%;
+        background: transparent;
+        color: var(--oc-muted);
+        font: inherit;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .qx-image-remove:hover {
+        background: var(--oc-hover);
+        color: var(--oc-fg);
+      }
+      .qx-list {
+        /* The queue is the region that gives and takes: a large shrink factor
+           makes it absorb every layout change (a longer switch hint, a growing
+           composer) before the controls above are allowed to shrink. */
+        flex: 1 100 auto;
+        min-height: 0;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--oc-border);
+        border-radius: var(--oc-radius, 8px);
+      }
+      .qx-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        /* The action bar never shrinks, so on a narrow panel the text would be
+           squeezed to a couple of characters per line. Let the row wrap instead:
+           the text keeps the whole first line and the actions move below it,
+           still against the right edge. */
+        flex-wrap: wrap;
+        row-gap: 6px;
+      }
+      .qx-row + .qx-row,
+      .qx-row + .qx-edit,
+      .qx-edit + .qx-row,
+      .qx-edit + .qx-edit {
+        border-top: 1px solid var(--oc-border);
+      }
+      .qx-row-editable {
+        cursor: pointer;
+      }
+      .qx-row-editable:hover {
+        background: var(--oc-hover);
+      }
+      /* A task switched off for the scheduler: still in the list, in its place
+         and editable, just muted so it reads as "will not start on its own". */
+      .qx-row-disabled .qx-row-text {
+        color: var(--oc-muted);
+      }
+      .qx-row-body {
+        /* Enough room to read a line; below that the actions wrap instead of the
+           text collapsing. */
+        flex: 1 1 150px;
+        min-width: 0;
+      }
+      .qx-row-text {
+        /* The content reads as a short summary: up to three lines, keeping its
+           own line breaks, so a longer task is legible without opening the
+           editor. Whatever is past the third line is clipped. */
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 3;
+        line-clamp: 3;
+        overflow: hidden;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .qx-row-sub {
+        color: var(--oc-muted);
+        font-size: 11px;
+        /* Wraps instead of truncating: the session a task appends to has to read
+           in full, and so does a failure reason, however long the title is. */
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+      .qx-row-actions {
+        display: flex;
+        gap: 4px;
+        flex: none;
+        align-items: center;
+        /* Wrapped onto its own line, the bar still lines up with the right edge
+           of the row. */
+        margin-left: auto;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      /* A compact checkbox beside the small action buttons (per task) and on the
+         composer caption line: the SDK default is a full-width block with a
+         14px label, which is too large for either. */
+      .qx-row-actions .oc-sdk-check,
+      .qx-composer-head .oc-sdk-check {
+        width: auto;
+        align-items: center;
+        gap: 4px;
+      }
+      .qx-row-actions .oc-sdk-check-box,
+      .qx-composer-head .oc-sdk-check-box {
+        margin-top: 0;
+      }
+      .qx-row-actions .oc-sdk-check-label,
+      .qx-composer-head .oc-sdk-check-label {
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      .qx-pos {
+        color: var(--oc-muted);
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+        min-width: 16px;
+        text-align: right;
+      }
+      .qx-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex: none;
+        background: var(--oc-muted);
+      }
+      .qx-dot-running {
+        background: var(--oc-primary);
+      }
+      .qx-dot-failed {
+        background: var(--oc-error);
+      }
+      .qx-edit {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+      }
+      .qx-edit-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+      /* First paint, before the queue has been read. */
+      .qx-loading {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* A user-driven request is in flight: a slim bar at the very top. The bar
+         sits outside #root so a re-render never disturbs it. */
+      .qx-busy {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 2px;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 10;
+      }
+      .qx-busy::before {
+        content: "";
+        display: block;
+        width: 40%;
+        height: 100%;
+        border-radius: 9999px;
+        background: var(--oc-primary);
+        animation: qx-busy-slide 900ms ease-in-out infinite;
+      }
+      /* A narrow panel (a phone, or the rail dragged thin) needs its own reading
+         order. Each threshold is where the thing it changes stops fitting on one
+         line, measured with the labels as shipped. The panel is an iframe, so
+         the viewport width is the panel width. */
+      /* Four composer buttons need about 430px of content; below that, pair them
+         up so the wrapped rows line up instead of leaving a ragged gap. */
+      @media (max-width: 460px) {
+        .qx-composer-actions {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+        }
+        .qx-composer-actions > button {
+          width: 100%;
+          min-width: 0;
+        }
+      }
+      /* The title row needs about 360px of content for the badges to sit at its
+         right; below that they wrap, and floating right on a line of their own
+         leaves a gap, so let them flow after the project name. */
+      @media (max-width: 400px) {
+        .qx-counts {
+          margin-left: 0;
+          justify-content: flex-start;
+        }
+      }
+      /* The settings summary needs about 300px for its values beside the title;
+         below that the values go under it, left-aligned with the title. */
+      @media (max-width: 350px) {
+        .qx-settings-summary {
+          flex-wrap: wrap;
+          row-gap: 2px;
+        }
+        .qx-settings-title {
+          flex: 0 0 auto;
+        }
+        .qx-settings-values {
+          flex: 1 1 100%;
+          margin-left: 14px;
+          text-align: left;
+        }
+      }
+      @keyframes qx-busy-slide {
+        from {
+          transform: translateX(-100%);
+        }
+        to {
+          transform: translateX(350%);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="main.js"></script>
+  </body>
+</html>

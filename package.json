@@ -1,0 +1,66 @@
+{
+  "name": "openchamber-queue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-project task queue for OpenChamber: starts a session with the next task whenever the project has no running session.",
+  "keywords": [
+    "openchamber",
+    "openchamber-extension",
+    "queue",
+    "task-queue",
+    "automation"
+  ],
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node _temp/test-service.mjs && bun _temp/test-i18n.ts"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.0.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "queue",
+        "name": "Queue",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "background": {
+        "entry": "panel/background.html"
+      },
+      "page": true,
+      "capabilities": [
+        "sessions",
+        "prompt"
+      ],
+      "actions": [
+        {
+          "id": "enqueue-message",
+          "label": "Add to queue",
+          "icon": "add-line",
+          "where": "message",
+          "mode": "background"
+        }
+      ],
+      "commands": [
+        {
+          "name": "queue",
+          "description": "Add a task to the current project queue"
+        }
+      ],
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      }
+    }
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "^2.0.4",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
